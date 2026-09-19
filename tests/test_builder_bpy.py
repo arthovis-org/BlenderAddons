@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 try:
     import bpy  # noqa: F401
-    from mathutils import Vector
+    from mathutils import Matrix, Vector
 except ImportError:  # pragma: no cover
     bpy = None
 
@@ -65,13 +65,15 @@ class BuilderTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _build(self, icon_mode, orientation="XZ", center=False, icon_format=None, font_override=None):
+    def _build(self, icon_mode, orientation="XZ", center=False, icon_format=None, font_override=None, **extra):
         from figma_to_blender import builder
 
         fmt = icon_format or ("svg" if icon_mode == "SVG" else "png")
         make_bundle(self.tmp, icon_format=fmt, font_override=font_override)
         scene = load_scene(self.tmp)
-        opts = builder.BuildOptions(scale=0.001, depth_step=0.0005, icon_mode=icon_mode, plane_orientation=orientation, center=center)
+        opts = builder.BuildOptions(
+            scale=0.001, depth_step=0.0005, icon_mode=icon_mode, plane_orientation=orientation, center=center, **extra
+        )
         report = builder.build_scene(scene, self.tmp, opts)
         return scene, report, opts
 
@@ -88,8 +90,8 @@ class BuilderTests(unittest.TestCase):
         curves = [o for o in report.objects if o.type == "CURVE"]
         empties = [o for o in report.objects if o.type == "EMPTY"]
         self.assertEqual(len(fonts), 5)
-        self.assertEqual(len(meshes), 6)  # 4 rects + ellipse + image plane
-        self.assertEqual(len(curves), 5 * 2)  # fixture SVG has 2 shapes, 5 icons
+        self.assertEqual(len(meshes), 5)  # 4 rects + image plane (ellipse is a curve)
+        self.assertEqual(len(curves), 5 * 2 + 1)  # fixture SVG has 2 shapes, 5 icons, + ellipse curve
         self.assertEqual(len(empties), 5 + 5)  # groups + icon roots
         for ob in report.objects:
             self.assertIn(coll, ob.users_collection)
@@ -109,11 +111,19 @@ class BuilderTests(unittest.TestCase):
         # the importer's SVG fill colours are preserved
         mats = {m.name for o in children for m in o.data.materials}
         self.assertTrue(mats)
+        # non-destructive: the icon is sized through the parent Empty's transform, the
+        # curve data / child transforms are left exactly as the importer made them
+        self.assertNotAlmostEqual(arrow.matrix_world.to_scale().x, 1.0, places=3)
+        for child in children:
+            self.assertEqual(tuple(child.scale), (1.0, 1.0, 1.0))
+            self.assertEqual(child.matrix_parent_inverse, Matrix.Identity(4))
 
     def test_plane_mode_objects(self):
         scene, report, _ = self._build("PLANE")
         self.assertEqual(report.counts["icon"], 5)
-        self.assertFalse([o for o in report.objects if o.type == "CURVE"])
+        # no icon curves in PLANE mode (the ellipse curve is unrelated to icon mode)
+        self.assertFalse([o for o in report.objects if o.type == "CURVE" and o.get("figma_kind") != "ellipse"])
+        self.assertEqual(len([o for o in report.objects if o.type == "CURVE"]), 1)
         arrow = self._by_name(report, "Arrow")
         self.assertEqual(arrow.type, "MESH")
         lo, hi = obj_bbox([arrow])
@@ -228,12 +238,129 @@ class BuilderTests(unittest.TestCase):
         self.assertIsNot(button.data.materials[0], amat)  # same colour, different alpha
         header = self._by_name(report, "Header")
         self.assertTrue(header["figma_fill_approx"])
-        # rounded corners: header has 2 rounded + 2 sharp corners
-        self.assertEqual(len(header.data.vertices), 2 * 9 + 2)
+        # the ellipse is a filled curve carrying the same flat material
+        ellipse = self._by_name(report, "Avatar bg")
+        self.assertEqual(ellipse.type, "CURVE")
+        self.assertIs(ellipse.data.materials[0], amat)
+
+    # -- non-destructive shapes ----------------------------------------------
+
+    def _corner_modifier(self, ob):
+        mods = [m for m in ob.modifiers if m.type == "BEVEL"]
+        self.assertEqual(len(mods), 1, "expected exactly one Bevel modifier on %s" % ob.name)
+        mod = mods[0]
+        self.assertEqual(mod.name, "Corner Radius")
+        self.assertEqual(mod.affect, "VERTICES")
+        self.assertEqual(mod.limit_method, "WEIGHT")
+        self.assertEqual(mod.offset_type, "OFFSET")
+        return mod
+
+    def _evaluated(self, ob):
+        bpy.context.view_layer.update()
+        return ob.evaluated_get(bpy.context.evaluated_depsgraph_get())
+
+    def test_rect_is_plane_with_corner_radius_modifier(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG")
+        header = self._by_name(report, "Header")
+        # the mesh itself stays a sharp 4-vertex quad with UVs, object scale untouched
+        self.assertEqual(header.type, "MESH")
+        self.assertEqual(len(header.data.vertices), 4)
         self.assertEqual(len(header.data.polygons), 1)
         self.assertTrue(header.data.uv_layers)
+        self.assertEqual(tuple(header.scale), (1.0, 1.0, 1.0))
+        self.assertAlmostEqual(header.dimensions.x, 0.360, places=6)
+        self.assertAlmostEqual(header.dimensions.y, 0.120, places=6)
+        # vertex order is Figma's tl, tr, br, bl (local frame: x right, y up)
+        co = [tuple(round(c, 6) for c in v.co) for v in header.data.vertices]
+        self.assertEqual(co, [(-0.18, 0.06, 0.0), (0.18, 0.06, 0.0), (0.18, -0.06, 0.0), (-0.18, -0.06, 0.0)])
+        # rectangleCornerRadii [16, 16, 0, 0] -> width 16 px, weights per corner
+        mod = self._corner_modifier(header)
+        self.assertAlmostEqual(mod.width, 0.016, places=6)
+        self.assertEqual(mod.segments, 8)
+        self.assertEqual(builder.vertex_bevel_weights(header.data), [1.0, 1.0, 0.0, 0.0])
+        # the evaluated mesh has 2 rounded (segments + 1 verts) + 2 sharp corners and keeps its UVs and size
+        ev = self._evaluated(header)
+        self.assertEqual(len(ev.data.vertices), 2 * 9 + 2)
+        self.assertEqual(len(ev.data.polygons), 1)
+        self.assertTrue(ev.data.uv_layers)
+        self.assertAlmostEqual(ev.dimensions.x, 0.360, places=6)
+        # uniform cornerRadius -> every corner weight 1
+        card = self._by_name(report, "Card (background)")
+        mod = self._corner_modifier(card)
+        self.assertAlmostEqual(mod.width, 0.016, places=6)
+        self.assertEqual(builder.vertex_bevel_weights(card.data), [1.0] * 4)
+        self.assertEqual(len(self._evaluated(card).data.vertices), 4 * 9)
+        button = self._by_name(report, "Button (background)")
+        self.assertAlmostEqual(self._corner_modifier(button).width, 0.008, places=6)
+        # image plane: plain textured quad, radius 24 on a 48 px photo is clamped to min(w, h) / 2
+        photo = self._by_name(report, "Photo")
+        self.assertEqual(len(photo.data.vertices), 4)
+        self.assertAlmostEqual(self._corner_modifier(photo).width, 0.024, places=6)
+        self.assertAlmostEqual(self._evaluated(photo).dimensions.x, 0.048, places=6)
+        self.assertEqual(photo.data.materials[0].node_tree.nodes["Image Texture"].type, "TEX_IMAGE")
+
+    def test_corner_segments_option(self):
+        scene, report, _ = self._build("SVG", corner_segments=4)
+        header = self._by_name(report, "Header")
+        self.assertEqual(self._corner_modifier(header).segments, 4)
+        self.assertEqual(len(self._evaluated(header).data.vertices), 2 * 5 + 2)
+
+    def test_per_corner_weights_and_zero_radius(self):
+        from figma_to_blender import builder
+
+        mesh = builder.plane_mesh("sq", 0.2, 0.1)
+        ob = bpy.data.objects.new("sq", mesh)
+        bpy.context.scene.collection.objects.link(ob)
+        # tl 0.01, tr 0.05, br 0.02, bl 0.5 (clamped to min(w, h) / 2 = 0.05)
+        mod = builder.add_corner_radius_modifier(ob, 0.2, 0.1, [0.01, 0.05, 0.02, 0.5], segments=6)
+        self.assertAlmostEqual(mod.width, 0.05, places=6)
+        self.assertEqual(mod.segments, 6)
+        weights = builder.vertex_bevel_weights(mesh)
+        self.assertAlmostEqual(weights[0], 0.2, places=6)  # tl
+        self.assertAlmostEqual(weights[1], 1.0, places=6)  # tr
+        self.assertAlmostEqual(weights[2], 0.4, places=6)  # br
+        self.assertAlmostEqual(weights[3], 1.0, places=6)  # bl
+        ev = self._evaluated(ob)
+        self.assertEqual(len(ev.data.vertices), 4 * 7)
+        # the rounded top-right corner no longer reaches the sharp corner point
+        xs = [v.co for v in ev.data.vertices]
+        self.assertFalse(any(abs(c.x - 0.1) < 1e-9 and abs(c.y - 0.05) < 1e-9 for c in xs))
+        # no radius at all: modifier present with width 0 and weights 1 so it can be dialled in later
+        mesh2 = builder.plane_mesh("sharp", 0.2, 0.1)
+        ob2 = bpy.data.objects.new("sharp", mesh2)
+        bpy.context.scene.collection.objects.link(ob2)
+        mod2 = builder.add_corner_radius_modifier(ob2, 0.2, 0.1, None)
+        self.assertEqual(mod2.width, 0.0)
+        self.assertEqual(builder.vertex_bevel_weights(mesh2), [1.0] * 4)
+        self.assertEqual(len(self._evaluated(ob2).data.vertices), 4)
+        mod2.width = 0.03
+        self.assertEqual(len(self._evaluated(ob2).data.vertices), 4 * 9)
+
+    def test_ellipse_is_filled_curve(self):
+        scene, report, _ = self._build("SVG")
         ellipse = self._by_name(report, "Avatar bg")
-        self.assertEqual(len(ellipse.data.vertices), 64)
+        self.assertEqual(ellipse.type, "CURVE")
+        cu = ellipse.data
+        self.assertEqual(cu.dimensions, "2D")
+        self.assertEqual(cu.fill_mode, "BOTH")
+        self.assertEqual(cu.resolution_u, 24)
+        self.assertEqual(len(cu.splines), 1)
+        self.assertEqual(cu.splines[0].type, "BEZIER")
+        self.assertTrue(cu.splines[0].use_cyclic_u)
+        self.assertEqual(len(cu.splines[0].bezier_points), 4)
+        self.assertEqual(tuple(ellipse.scale), (1.0, 1.0, 1.0))
+        # 64 x 64 px -> 0.064 m, sized through the control points
+        self.assertAlmostEqual(ellipse.dimensions.x, 0.064, places=6)
+        self.assertAlmostEqual(ellipse.dimensions.y, 0.064, places=6)
+        ev = self._evaluated(ellipse)
+        me = ev.to_mesh()
+        self.assertGreater(len(me.polygons), 0)
+        ev.to_mesh_clear()
+        # centred on the node: Avatar group at Card(100,200)+(24,260) = (124,460), 64x64 -> centre (156, 492)
+        self.assertAlmostEqual(ellipse.location.x, 0.156, places=6)
+        self.assertAlmostEqual(ellipse.location.z, -0.492, places=6)
 
     def test_missing_asset_is_reported_not_fatal(self):
         from figma_to_blender import builder
