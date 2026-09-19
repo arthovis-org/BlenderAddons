@@ -28,7 +28,7 @@ if bpy is not None:
     import tempfile
     import traceback
 
-    from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty, StringProperty
+    from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
     from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 
     from . import builder, scene_model
@@ -86,6 +86,13 @@ if bpy is not None:
         depth_step: FloatProperty(
             name="Depth step", description="Offset between consecutive elements in draw order (avoids z-fighting)", default=0.0005, min=0.0, precision=5, step=0.01
         )
+        corner_segments: IntProperty(
+            name="Corner segments",
+            description="Segments per rounded corner on the 'Corner Radius' Bevel modifier of rectangles and image planes (editable later)",
+            default=builder.CORNER_SEGMENTS,
+            min=1,
+            max=64,
+        )
         icon_max_size: FloatProperty(name="Icon max size", description="Vector groups up to this size (px) are imported as one icon", default=128.0, min=1.0)
         raster_scale: FloatProperty(name="Raster scale", description="PNG export scale for image fills and plane icons", default=2.0, min=0.1, max=4.0)
         orientation: EnumProperty(
@@ -102,7 +109,12 @@ if bpy is not None:
 
     def build_options(s: "FIGMA_settings") -> builder.BuildOptions:
         return builder.BuildOptions(
-            scale=s.scale, depth_step=s.depth_step, icon_mode=s.icon_mode, plane_orientation=s.orientation, center=s.center
+            scale=s.scale,
+            depth_step=s.depth_step,
+            icon_mode=s.icon_mode,
+            plane_orientation=s.orientation,
+            center=s.center,
+            corner_segments=s.corner_segments,
         )
 
     def export_options(s: "FIGMA_settings") -> scene_model.ExportOptions:
@@ -267,6 +279,7 @@ if bpy is not None:
             col = box.column(align=True)
             col.prop(s, "scale")
             col.prop(s, "depth_step")
+            col.prop(s, "corner_segments")
             col.prop(s, "icon_max_size")
             col.prop(s, "raster_scale")
             box.prop(s, "center")

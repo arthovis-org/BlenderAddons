@@ -12,6 +12,15 @@ rotation then maps that frame into the chosen ``plane_orientation``:
 
 * ``XZ`` (default): the UI stands upright and faces -Y (Blender front view).
 * ``XY``: the UI lies flat on the ground, depth stacks along +Z.
+
+Non-destructive by design
+-------------------------
+Nothing that Blender can express as an object property, modifier or curve
+parameter is baked into geometry: rectangles are plain 4-vertex planes with a
+"Corner Radius" Bevel modifier (per-corner radii as vertex bevel weights),
+ellipses are 2D Bezier curves, SVG icons keep the importer's curves and are
+sized through the parent Empty's transform, rotation lives on the object and
+colour lives in the material.
 """
 
 from __future__ import annotations
@@ -25,7 +34,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import bpy
-import bmesh
 from mathutils import Matrix, Vector
 
 from . import fonts
@@ -33,8 +41,11 @@ from .scene_model import Element, Scene, load_scene
 
 log = logging.getLogger(__name__)
 
-CORNER_SEGMENTS = 8
-ELLIPSE_SEGMENTS = 64
+CORNER_SEGMENTS = 8  # default Bevel modifier segments per rounded corner
+ELLIPSE_RESOLUTION = 24  # curve resolution_u (points per Bezier segment) for ellipses
+CORNER_MODIFIER_NAME = "Corner Radius"
+BEVEL_WEIGHT_ATTR = "bevel_weight_vert"  # Blender 4.x+ stores vertex bevel weights here
+BEZIER_CIRCLE_K = 0.5522847498  # handle length / radius for a 4-point Bezier circle
 TEXT_ASCENT_RATIO = 0.8  # approximate ascender / font size used to place Figma baselines
 
 
@@ -45,6 +56,7 @@ class BuildOptions:
     icon_mode: str = "SVG"  # "SVG" (curves) | "PLANE" (textured plane)
     plane_orientation: str = "XZ"  # "XZ" | "XY"
     center: bool = True  # put the page bounds' centre at the world origin
+    corner_segments: int = CORNER_SEGMENTS  # Bevel modifier segments for rounded corners
     collection_name: Optional[str] = None
 
 
@@ -185,67 +197,123 @@ def make_image_material(name: str, image: "bpy.types.Image", alpha: float = 1.0)
 
 # ---------------------------------------------------------------------------
 # Geometry helpers (built in the local 2D frame: x right, y up, centred)
+#
+# Shapes are kept editable: a rectangle is a 4-vertex plane whose rounded
+# corners come from a Bevel modifier, an ellipse is a Bezier curve.
 # ---------------------------------------------------------------------------
 
 
-def rounded_rect_outline(w: float, h: float, radii: Optional[List[float]]) -> List[Tuple[float, float]]:
-    """Outline points of a w x h rectangle centred on the origin (y up).
+def plane_mesh(name: str, w: float, h: float) -> "bpy.types.Mesh":
+    """A w x h quad centred on the origin (y up) with a 0..1 UV layer.
 
-    ``radii`` is Figma's ``[tl, tr, br, bl]`` in the same units as w/h.
+    Vertex order follows Figma's corner order ``[tl, tr, br, bl]`` so that
+    ``rectangleCornerRadii`` maps 1:1 onto vertex bevel weights.
     """
-    radii = list(radii or [0.0, 0.0, 0.0, 0.0])
-    cap = min(w, h) / 2.0
-    tl, tr, br, bl = (max(0.0, min(float(r), cap)) for r in radii)
     hw, hh = w / 2.0, h / 2.0
-    pts: List[Tuple[float, float]] = []
-
-    # corners in counter-clockwise order starting bottom-left: (centre, radius, start angle)
-    corners = (
-        ((-hw + bl, -hh + bl), bl, math.pi),  # bottom-left
-        ((hw - br, -hh + br), br, 1.5 * math.pi),  # bottom-right
-        ((hw - tr, hh - tr), tr, 0.0),  # top-right
-        ((-hw + tl, hh - tl), tl, 0.5 * math.pi),  # top-left
-    )
-    for (cx, cy), r, start in corners:
-        if r <= 1e-9:
-            # sharp corner
-            sx = -hw if cx < 0 else hw
-            sy = -hh if cy < 0 else hh
-            pts.append((sx, sy))
-            continue
-        for i in range(CORNER_SEGMENTS + 1):
-            a = start + (math.pi / 2.0) * (i / CORNER_SEGMENTS)
-            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
-    # remove consecutive duplicates
-    out: List[Tuple[float, float]] = []
-    for p in pts:
-        if not out or (abs(out[-1][0] - p[0]) > 1e-9 or abs(out[-1][1] - p[1]) > 1e-9):
-            out.append(p)
-    if len(out) > 1 and abs(out[0][0] - out[-1][0]) < 1e-9 and abs(out[0][1] - out[-1][1]) < 1e-9:
-        out.pop()
-    return out
-
-
-def ellipse_outline(w: float, h: float, segments: int = ELLIPSE_SEGMENTS) -> List[Tuple[float, float]]:
-    return [
-        (w / 2.0 * math.cos(2 * math.pi * i / segments), h / 2.0 * math.sin(2 * math.pi * i / segments))
-        for i in range(segments)
-    ]
-
-
-def mesh_from_outline(name: str, outline: List[Tuple[float, float]], w: float, h: float) -> "bpy.types.Mesh":
-    """Single n-gon mesh with a 0..1 UV layer spanning the w x h box."""
-    bm = bmesh.new()
-    verts = [bm.verts.new((x, y, 0.0)) for x, y in outline]
-    face = bm.faces.new(verts)
-    uv_layer = bm.loops.layers.uv.new("UVMap")
-    for loop in face.loops:
-        x, y, _ = loop.vert.co
-        loop[uv_layer].uv = ((x + w / 2.0) / w if w else 0.5, (y + h / 2.0) / h if h else 0.5)
+    verts = [(-hw, hh, 0.0), (hw, hh, 0.0), (hw, -hh, 0.0), (-hw, -hh, 0.0)]  # tl, tr, br, bl
     mesh = bpy.data.meshes.new(name)
-    bm.to_mesh(mesh)
-    bm.free()
+    mesh.from_pydata(verts, [], [(0, 3, 2, 1)])  # counter-clockwise -> normal towards +Z (the viewer)
+    uv = mesh.uv_layers.new(name="UVMap")
+    for poly in mesh.polygons:
+        for li in poly.loop_indices:
+            x, y, _ = mesh.vertices[mesh.loops[li].vertex_index].co
+            uv.data[li].uv = ((x + hw) / w if w else 0.5, (y + hh) / h if h else 0.5)
+    mesh.update()
     return mesh
+
+
+def set_vertex_bevel_weights(mesh: "bpy.types.Mesh", weights: List[float]) -> None:
+    """Write per-vertex bevel weights (Blender 3.x ``MeshVertex.bevel_weight`` or the 4.x+ attribute)."""
+    if len(mesh.vertices) and hasattr(mesh.vertices[0], "bevel_weight"):  # Blender <= 3.x
+        if hasattr(mesh, "use_customdata_vertex_bevel"):
+            mesh.use_customdata_vertex_bevel = True
+        for v, wgt in zip(mesh.vertices, weights):
+            v.bevel_weight = float(wgt)
+        return
+    attr = mesh.attributes.get(BEVEL_WEIGHT_ATTR)
+    if attr is None:
+        attr = mesh.attributes.new(BEVEL_WEIGHT_ATTR, "FLOAT", "POINT")
+    for i, wgt in enumerate(weights):
+        attr.data[i].value = float(wgt)
+
+
+def vertex_bevel_weights(mesh: "bpy.types.Mesh") -> List[float]:
+    """Read back what :func:`set_vertex_bevel_weights` wrote (used by tests and re-sync)."""
+    if len(mesh.vertices) and hasattr(mesh.vertices[0], "bevel_weight"):
+        return [float(v.bevel_weight) for v in mesh.vertices]
+    attr = mesh.attributes.get(BEVEL_WEIGHT_ATTR)
+    if attr is None:
+        return [0.0] * len(mesh.vertices)
+    return [float(d.value) for d in attr.data]
+
+
+def corner_radius_weights(w: float, h: float, radii: Optional[List[float]]) -> Tuple[float, List[float]]:
+    """``(bevel width, [tl, tr, br, bl] weights)`` for a w x h rectangle.
+
+    Radii are clamped to ``min(w, h) / 2``.  When every radius is 0 the width
+    is 0 and all weights are 1 so a radius can be dialled in on the modifier.
+    """
+    cap = min(w, h) / 2.0
+    vals = [max(0.0, min(float(r), cap)) for r in (radii or [0.0, 0.0, 0.0, 0.0])]
+    while len(vals) < 4:
+        vals.append(vals[-1] if vals else 0.0)
+    rmax = max(vals[:4])
+    if rmax <= 0.0:
+        return 0.0, [1.0, 1.0, 1.0, 1.0]
+    return rmax, [r / rmax for r in vals[:4]]
+
+
+def add_corner_radius_modifier(
+    ob: "bpy.types.Object", w: float, h: float, radii: Optional[List[float]], segments: int = CORNER_SEGMENTS
+) -> "bpy.types.Modifier":
+    """Round the corners of a :func:`plane_mesh` object with a Bevel modifier.
+
+    The modifier only touches vertices, is limited by vertex bevel weight, and
+    its ``width`` is the largest corner radius; smaller corners get a weight of
+    ``radius / max_radius`` so Figma's per-corner radii survive.  Turning the
+    modifier off (or deleting it) gives the sharp rectangle back.
+    """
+    width, weights = corner_radius_weights(w, h, radii)
+    set_vertex_bevel_weights(ob.data, weights)
+    mod = ob.modifiers.new(CORNER_MODIFIER_NAME, "BEVEL")
+    mod.affect = "VERTICES"
+    mod.limit_method = "WEIGHT"
+    mod.offset_type = "OFFSET"
+    mod.width = width
+    mod.segments = max(1, int(segments))
+    mod.show_expanded = False
+    return mod
+
+
+def ellipse_curve(name: str, w: float, h: float, resolution: int = ELLIPSE_RESOLUTION) -> "bpy.types.Curve":
+    """Filled 2D Bezier ellipse (4 aligned control points) spanning w x h, centred on the origin.
+
+    The size lives in the control points rather than the object scale so the
+    object's scale stays 1 like every other imported shape.
+    """
+    cu = bpy.data.curves.new(name, "CURVE")
+    cu.dimensions = "2D"
+    cu.fill_mode = "BOTH"
+    cu.resolution_u = max(1, int(resolution))
+    sp = cu.splines.new("BEZIER")
+    sp.bezier_points.add(3)
+    sp.use_cyclic_u = True
+    rx, ry = w / 2.0, h / 2.0
+    kx, ky = rx * BEZIER_CIRCLE_K, ry * BEZIER_CIRCLE_K
+    # counter-clockwise: right, top, left, bottom; (co, handle_left, handle_right)
+    points = (
+        ((rx, 0.0), (rx, -ky), (rx, ky)),
+        ((0.0, ry), (kx, ry), (-kx, ry)),
+        ((-rx, 0.0), (-rx, ky), (-rx, -ky)),
+        ((0.0, -ry), (-kx, -ry), (kx, -ry)),
+    )
+    for bp, (co, hl, hr) in zip(sp.bezier_points, points):
+        bp.handle_left_type = bp.handle_right_type = "FREE"
+        bp.co = (co[0], co[1], 0.0)
+        bp.handle_left = (hl[0], hl[1], 0.0)
+        bp.handle_right = (hr[0], hr[1], 0.0)
+        bp.handle_left_type = bp.handle_right_type = "ALIGNED"
+    return cu
 
 
 # ---------------------------------------------------------------------------
@@ -400,31 +468,41 @@ class SceneBuilder:
         ob.matrix_world = self.matrix_for(el, depth, (0.0, 0.0))
         return ob
 
+    def _rect_object(self, el: Element, radii: Optional[List[float]], always_modifier: bool) -> "bpy.types.Object":
+        """Plane object at the element's size (object scale 1) plus a Corner Radius Bevel modifier."""
+        s = self.opt.scale
+        w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
+        mesh = plane_mesh(el.name, w, h)
+        ob = self._new_object(el, el.name, mesh)
+        scaled = [r * s for r in radii] if radii else None
+        if scaled or always_modifier:
+            add_corner_radius_modifier(ob, w, h, scaled, self.opt.corner_segments)
+        return ob
+
     def build_shape(self, el: Element, depth: int) -> "bpy.types.Object":
         s = self.opt.scale
         w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
         if el.kind == "ellipse":
-            outline = ellipse_outline(w, h)
+            data = ellipse_curve(el.name, w, h)
+            ob = self._new_object(el, el.name, data)
         else:
-            radii = [r * s for r in el.corner_radii] if el.corner_radii else None
-            outline = rounded_rect_outline(w, h, radii)
-        mesh = mesh_from_outline(el.name, outline, w, h)
-        ob = self._new_object(el, el.name, mesh)
+            # rect (or an icon / image falling back to its solid fill): always carry
+            # the modifier so a radius can be added later without touching the mesh
+            ob = self._rect_object(el, el.corner_radii, always_modifier=True)
+            data = ob.data
         color = el.fill or [0.5, 0.5, 0.5, 1.0]
         alpha = color[3] * el.opacity if len(color) > 3 else el.opacity
-        mesh.materials.append(self.materials.flat(color, alpha))
+        data.materials.append(self.materials.flat(color, alpha))
         if el.fill_approx:
             ob["figma_fill_approx"] = True
         ob.matrix_world = self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0))
         return ob
 
     def build_plane(self, el: Element, depth: int, path: str) -> "bpy.types.Object":
-        s = self.opt.scale
-        w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
-        radii = [r * s for r in el.corner_radii] if (el.kind == "image" and el.corner_radii) else None
-        outline = rounded_rect_outline(w, h, radii)
-        mesh = mesh_from_outline(el.name, outline, w, h)
-        ob = self._new_object(el, el.name, mesh)
+        # plain textured quad; image fills with corner radii get the same Bevel modifier
+        radii = el.corner_radii if (el.kind == "image" and el.corner_radii) else None
+        ob = self._rect_object(el, radii, always_modifier=False)
+        mesh = ob.data
         try:
             image = bpy.data.images.load(path, check_existing=True)
             mesh.materials.append(self.materials.image(image, el.opacity))
