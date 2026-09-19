@@ -1,7 +1,7 @@
 """Builder tests. They run only when ``bpy`` is importable (Blender or the ``bpy`` wheel).
 
     pip install bpy   # Python 3.11 for Blender 4.x wheels
-    python -m pytest tests/test_builder_bpy.py -q
+    python -m pytest figma_to_blender/tests/test_builder_bpy.py -q
 
 Set ``FIGMA_RENDER_OUT=/path/render.png`` to also write a headless render of the
 fixture page (proof-of-work screenshot).
@@ -16,7 +16,7 @@ import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
 try:
     import bpy  # noqa: F401

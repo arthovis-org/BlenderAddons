@@ -4,3 +4,4 @@ __pycache__/
 *.zip
 bundle/
 /render.png
+dist/

@@ -12,8 +12,8 @@ bl_info = {
     "blender": (3, 6, 0),
     "location": "3D Viewport > Sidebar (N) > Figma",
     "description": "Import a Figma page as editable 3D UI: text, rounded shapes, icons (SVG curves or planes) and images",
-    "doc_url": "https://github.com/arthovis-org/empty2",
-    "tracker_url": "https://github.com/arthovis-org/empty2/issues",
+    "doc_url": "https://github.com/arthovis-org/BlenderAddons",
+    "tracker_url": "https://github.com/arthovis-org/BlenderAddons/issues",
     "category": "Import-Export",
 }
 

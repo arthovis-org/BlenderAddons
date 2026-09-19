@@ -1,4 +1,4 @@
-name: Build add-on
+name: Build add-ons
 
 on:
   push:
@@ -7,18 +7,28 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # one entry per add-on folder in this repo
+        addon: [figma_to_blender]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run pure-Python tests
-        run: python -m unittest discover -s tests
+      - name: Run pure-Python tests (${{ matrix.addon }})
+        run: |
+          if [ -d "${{ matrix.addon }}/tests" ]; then
+            python -m unittest discover -s "${{ matrix.addon }}/tests" -t .
+          else
+            echo "no tests folder for ${{ matrix.addon }}"
+          fi
 
       - name: Build add-on zip
-        run: python tools/build_zip.py --out figma_to_blender.zip
+        run: python tools/build_zip.py --addon "${{ matrix.addon }}" --out-dir dist
 
       - name: Upload add-on zip
         uses: actions/upload-artifact@v4
         with:
-          name: figma_to_blender
-          path: figma_to_blender.zip
+          name: ${{ matrix.addon }}
+          path: dist/${{ matrix.addon }}.zip
           if-no-files-found: error

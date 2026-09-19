@@ -11,7 +11,7 @@ import urllib.error
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
 from figma_to_blender import cli, figma_api, scene_model  # noqa: E402
 from figma_to_blender.figma_api import FigmaClient, parse_file_key, sanitize_id  # noqa: E402
