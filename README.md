@@ -1,9 +1,10 @@
 # Figma to Blender
 
 A Blender add-on that imports a **Figma page as editable 3D UI**: text becomes Blender text
-objects, rectangles and ellipses become rounded meshes, icons become SVG curves (or textured
-planes), image fills become textured planes, and Figma frames/groups become parented Empties,
-so you can grab a whole card or menu and move it in 3D.
+objects, rectangles become planes with a *Corner Radius* Bevel modifier, ellipses become
+filled curves, icons become SVG curves (or textured planes), image fills become textured
+planes, and Figma frames/groups become parented Empties, so you can grab a whole card or menu
+and move it in 3D. Everything is built [non-destructively](#non-destructive-by-design).
 
 It talks to the Figma REST API directly from Blender (standard library only, no `requests`),
 and the same pure-Python core also runs as a CLI so a page can be exported once to an offline
@@ -13,17 +14,21 @@ and the same pure-Python core also runs as a CLI so a page can be exported once 
 
 ## Install
 
-**Blender 4.2+ (extension):** zip the `figma_to_blender/` folder (the zip must contain the
-folder with `blender_manifest.toml` inside it) and drag the zip into Blender, or use
-*Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk*.
-
-**Blender 3.6 - 4.1 (legacy add-on):** zip the same folder and use
-*Edit ▸ Preferences ▸ Add-ons ▸ Install…*, then enable *Import-Export: Figma to Blender*.
+Grab `figma_to_blender.zip`: every push and pull request runs the
+[Build add-on](.github/workflows/build-addon.yml) workflow, which runs the tests and uploads
+the zip as the `figma_to_blender` artifact (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
+To build it locally (standard library only):
 
 ```sh
-cd <repo>
-zip -r figma_to_blender.zip figma_to_blender -x '*__pycache__*'
+python tools/build_zip.py            # -> ./figma_to_blender.zip
 ```
+
+**Blender 4.2+ (extension):** drag the zip into Blender, or use
+*Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk*. The zip contains the
+`figma_to_blender/` folder with `blender_manifest.toml` inside it.
+
+**Blender 3.6 - 4.1 (legacy add-on):** *Edit ▸ Preferences ▸ Add-ons ▸ Install…* with the same
+zip, then enable *Import-Export: Figma to Blender*.
 
 ## Get a Figma token
 
@@ -44,6 +49,8 @@ Open the 3D Viewport sidebar (`N`) ▸ **Figma** tab.
    - **Scale**: metres per Figma px (default `0.001`, a 360 px card is 36 cm wide).
    - **Depth step**: offset per element in draw order so overlapping shapes never z-fight
      (later-drawn = in front).
+   - **Corner segments**: segments per rounded corner on the *Corner Radius* Bevel modifier
+     (default 8; change it later per object in the modifier itself).
    - **Icon max size**, **Raster scale**, **Center at origin**.
 4. **Import page**. A new collection named after the page appears, with one Empty per Figma
    frame/group and children parented to it. Every object carries `figma_id`, `figma_type`,
@@ -74,6 +81,28 @@ from figma_to_blender import builder
 report = builder.build_bundle("./bundle", builder.BuildOptions(icon_mode="SVG"))
 print(report.summary())
 ```
+
+## Non-destructive by design
+
+Whatever Blender can express as an object property, modifier or curve parameter is **not**
+baked into geometry, so you can keep tweaking after import:
+
+| Figma | Blender | Where to edit |
+|---|---|---|
+| Rectangle / frame fill | 4-vertex plane at the node size, object scale 1 | mesh stays a sharp quad |
+| Corner radius (`cornerRadius`, `rectangleCornerRadii`) | **Bevel modifier** *Corner Radius*: vertices only, `width` = largest radius, per-corner ratio stored as vertex bevel weight (tl, tr, br, bl), segments from *Corner segments* | modifier panel (width / segments), vertex bevel weights for per-corner radii; every rect carries the modifier even at radius 0 so you can dial one in |
+| Ellipse | filled **2D Bezier curve** (4 aligned points, resolution 24), sized through its control points | curve edit mode, `Resolution Preview U` |
+| Image fill | plane with an image texture material (+ the same Bevel modifier when the node has radii) | material nodes / modifier |
+| Icon (SVG mode) | the importer's curve objects, untouched, under an Empty whose **object transform** scales the SVG to the node size | move / scale the Empty; the curves are the raw SVG paths |
+| Position, rotation, flip | object `matrix_world` (rotation on the object, never in the mesh) | N panel |
+| Fill colour, opacity | emission material shared per colour | material |
+| Text | Blender text object (`size`, `align_x/y`, `space_line`, `space_character`, text box) | data properties |
+
+Still baked, because Blender has no parameter for it: the plane's *size* (a plane is its four
+vertices; scaling the object instead would distort the bevel), the ellipse's *size* (curve
+control points, kept editable), and the text baseline offset (a translation in the object
+matrix that compensates Blender's TOP alignment). Gradients are averaged into one colour and
+strokes/effects are not imported (see Limitations).
 
 ## How it works
 
@@ -132,19 +161,21 @@ viewBox). If the importer is unavailable, icons fall back to planes with a warni
 - Real gradients via colour-ramp shader nodes.
 - Per-run text styling from `characterStyleOverrides`.
 - Extrude presets (depth per kind) and a "re-sync from Figma" operator that updates existing
-  objects by `figma_id`.
-- Optional Geometry Nodes based rounded rectangles for non-destructive corner radii.
+  objects by `figma_id` (the Bevel modifier / curve data make this a property update).
 
 ## Development
 
 ```sh
-python -m pytest tests/ -q                  # pure-python tests (fixture in tests/fixtures)
+python -m unittest discover -s tests        # pure-python tests (fixture in tests/fixtures), also run in CI
 pip install bpy && python -m pytest tests/  # also runs the builder tests (Python 3.11)
 FIGMA_RENDER_OUT=render.png python -m pytest tests/test_builder_bpy.py -k render
+python tools/build_zip.py                   # the same zip CI uploads
 ```
 
 The bpy tests build the fixture page in both icon modes and assert object counts, types,
-positions, rotation, parenting, materials and the SVG icon's bounding box.
+positions, rotation, parenting, materials, the SVG icon's bounding box, the *Corner Radius*
+Bevel modifier (width, segments, per-corner vertex weights, evaluated vertex count) and the
+ellipse curve (2D, fill BOTH, dimensions).
 
 ## License
 

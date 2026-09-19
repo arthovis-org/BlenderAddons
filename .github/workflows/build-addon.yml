@@ -1,0 +1,24 @@
+name: Build add-on
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run pure-Python tests
+        run: python -m unittest discover -s tests
+
+      - name: Build add-on zip
+        run: python tools/build_zip.py --out figma_to_blender.zip
+
+      - name: Upload add-on zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: figma_to_blender
+          path: figma_to_blender.zip
+          if-no-files-found: error
