@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "figma_to_blender"
+version = "0.1.0"
+name = "Figma to Blender"
+tagline = "Import a Figma page as editable 3D UI"
+maintainer = "arthovis-org"
+type = "add-on"
+website = "https://github.com/arthovis-org/empty2"
+tags = ["Import-Export", "User Interface"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+
+[permissions]
+network = "Fetches page data and rendered SVG/PNG assets from api.figma.com"
+files = "Reads and writes scene bundles (scene.json + assets/) chosen by the user"
