@@ -161,6 +161,25 @@ if bpy is not None:
             "into the '<collection> (removed)' sub-collection",
             default=False,
         )
+        link_instances: BoolProperty(
+            name="Link component instances",
+            description="Elements of a component instance share the component's mesh / curve / text data (and material), "
+            "so editing one updates every instance. Overridden instance elements (own text, fill, size...) get their own data",
+            default=True,
+        )
+        instance_mode: EnumProperty(
+            name="Instance mode",
+            items=[
+                ("LINKED_DATA", "Linked data", "One object per instance element, sharing the component's datablocks"),
+                (
+                    "COLLECTION_INSTANCE",
+                    "Collection instances",
+                    "The component's objects go into their own collection and each instance is one Empty instancing it "
+                    "(components that are not part of the import fall back to linked data)",
+                ),
+            ],
+            default="LINKED_DATA",
+        )
         bundle_dir: StringProperty(name="Bundle folder", description="Folder containing scene.json and assets/", subtype="DIR_PATH")
         export_dir: StringProperty(name="Export to", description="Folder to write the bundle into", subtype="DIR_PATH")
 
@@ -174,6 +193,8 @@ if bpy is not None:
             corner_segments=s.corner_segments,
             update_existing=s.update_existing,
             remove_missing=s.remove_missing,
+            link_instances=s.link_instances,
+            instance_mode=s.instance_mode,
         )
 
     def export_options(s: "FIGMA_settings") -> scene_model.ExportOptions:
@@ -386,6 +407,11 @@ if bpy is not None:
             sub = box.row()
             sub.active = s.update_existing
             sub.prop(s, "remove_missing")
+
+            box = layout.box()
+            box.label(text="Component instances", icon="LINKED")
+            box.prop(s, "link_instances")
+            box.prop(s, "instance_mode", text="Mode")
             layout.operator(FIGMA_OT_import_page.bl_idname, icon="IMPORT")
 
             box = layout.box()

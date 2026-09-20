@@ -76,6 +76,15 @@ class Element:
     asset_format: Optional[str] = None
     text: Optional[Dict[str, Any]] = None
     flipped: bool = False
+    # Component instances (see ``component_path`` / ``detect_overrides``): the id of the COMPONENT this
+    # element belongs to (for the component's own elements as well as for every INSTANCE descendant), the
+    # element's position inside the component ("" = the root, ":bg" = its background, else the component
+    # child's id), whether it is part of the COMPONENT definition itself, and whether an instance
+    # descendant differs from the component (own text / fill / size...) so it must not share data.
+    component_id: Optional[str] = None
+    component_path: Optional[str] = None
+    is_component: bool = False
+    override: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -384,6 +393,105 @@ def text_info(node: dict) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Component instances
+# ---------------------------------------------------------------------------
+
+# ``overriddenFields`` (Figma's ``INSTANCE.overrides``) that change what a shared datablock would hold
+OVERRIDE_FIELDS = {
+    "characters",
+    "style",
+    "fills",
+    "size",
+    "cornerRadius",
+    "rectangleCornerRadii",
+    "strokes",
+    "strokeWeight",
+    "strokeAlign",
+    "opacity",
+    "fillGeometry",
+    "strokeGeometry",
+}
+
+
+def component_path(node_id: str, root_id: str) -> str:
+    """Position of a node inside its component, shared by the component and every instance.
+
+    Figma gives an instance's descendants ids of the form ``I<instanceId>;<componentChildId>``
+    (nested instances add more ``;`` segments: ``I<outer>;<inner>;<child>``), while the
+    component's own children keep plain ids.  The path is the component child's id, so the
+    instance child ``I3:10;3:3`` and the component child ``3:3`` both map to ``3:3``; the root
+    itself maps to ``""``.  A ``#n`` duplicate suffix is ignored.
+    """
+    node_id = node_id.split("#", 1)[0]
+    if node_id == root_id:
+        return ""
+    prefix = "I%s;" % root_id
+    if node_id.startswith(prefix):
+        rest = node_id[len(prefix) :]
+        return ("I" + rest) if ";" in rest else rest
+    return node_id
+
+
+def shared_signature(el: Element) -> tuple:
+    """Everything a datablock built from ``el`` holds; equal signatures may share one datablock.
+
+    Transform, parent, depth, name and asset *paths* are per object and left out; the
+    builder adds the asset's content hash for image planes.
+    """
+
+    def rnd(v):
+        if isinstance(v, float):
+            return round(v, 3)
+        if isinstance(v, (list, tuple)):
+            return tuple(rnd(x) for x in v)
+        if isinstance(v, dict):
+            return tuple(sorted((k, rnd(x)) for k, x in v.items()))
+        return v
+
+    return (
+        el.kind,
+        rnd(el.w),
+        rnd(el.h),
+        rnd(el.opacity),
+        rnd(el.fill),
+        rnd(el.fill_gradient),
+        rnd(el.stroke_rgba),
+        rnd(el.stroke_weight),
+        el.stroke_align,
+        rnd(el.corner_radii),
+        rnd(el.text),
+        el.asset_format,
+    )
+
+
+def detect_overrides(elements: List[Element]) -> int:
+    """Set ``override`` on instance descendants that differ from their component (or, when the
+    component is not part of the export, from the first instance seen in draw order).
+
+    Returns the number of overrides found.  Overrides Figma already reported through
+    ``INSTANCE.overrides`` stay set.
+    """
+    masters: Dict[Tuple[str, str], Element] = {}
+    for el in elements:  # the component's own elements win as masters
+        if el.is_component and el.component_id and el.component_path is not None:
+            masters.setdefault((el.component_id, el.component_path), el)
+    n = 0
+    for el in elements:
+        if not el.component_id or el.component_path is None or el.is_component:
+            continue
+        key = (el.component_id, el.component_path)
+        master = masters.get(key)
+        if master is None:
+            masters[key] = el  # no component in the export: the first instance stands in for it
+            continue
+        if shared_signature(el) != shared_signature(master):
+            el.override = True
+        if el.override:
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # Tree walk
 # ---------------------------------------------------------------------------
 
@@ -440,15 +548,48 @@ class SceneBuilder:
             if shape and el.fill is None:
                 el.fill = [0.0, 0.0, 0.0, 0.0]
 
-    def walk(self, node: dict, parent_id: Optional[str], parent_world: Matrix) -> None:
+    @staticmethod
+    def _component_context(node: dict, comp: Optional[dict]) -> Optional[dict]:
+        """Enter a COMPONENT / INSTANCE: ``{"id", "root", "is_component", "overrides"}`` carried to descendants.
+
+        The outermost component context wins: a nested instance inside a component
+        (or inside another instance) stays part of the outer one, so its elements
+        share data with the outer component's instances.
+        """
+        if comp is not None:
+            return comp
+        t = node.get("type")
+        if t == "INSTANCE" and node.get("componentId"):
+            overrides = {}
+            for ov in node.get("overrides") or []:
+                if ov.get("id") and set(ov.get("overriddenFields") or []) & OVERRIDE_FIELDS:
+                    overrides[ov["id"]] = True
+            return {"id": node["componentId"], "root": node["id"], "is_component": False, "overrides": overrides}
+        if t == "COMPONENT":
+            return {"id": node["id"], "root": node["id"], "is_component": True, "overrides": {}}
+        return None
+
+    @staticmethod
+    def _tag_component(el: Element, node: dict, comp: Optional[dict], suffix: str = "") -> None:
+        if comp is None:
+            return
+        el.component_id = comp["id"]
+        el.component_path = component_path(node["id"], comp["root"]) + suffix
+        el.is_component = comp["is_component"]
+        if node["id"] in comp["overrides"]:
+            el.override = True
+
+    def walk(self, node: dict, parent_id: Optional[str], parent_world: Matrix, comp: Optional[dict] = None) -> None:
         if not is_visible(node):
             return
         t = node.get("type")
         world = node_local_matrix(node, parent_world, self.page_to_scene)
         opts = self.options
+        comp = self._component_context(node, comp)
 
         if t == "TEXT":
             el = self._make(node, "text", parent_id, world)
+            self._tag_component(el, node, comp)
             self._paint(el, node, shape=False)
             el.text = text_info(node)
             if el.text.get("hasStyleOverrides"):
@@ -458,6 +599,7 @@ class SceneBuilder:
 
         if has_image_fill(node):
             el = self._make(node, "image", parent_id, world)
+            self._tag_component(el, node, comp)
             stroke = node_stroke(node)
             if stroke is not None:
                 el.stroke_rgba, el.stroke_weight, el.stroke_align = list(stroke[0]), stroke[1], stroke[2]
@@ -469,6 +611,7 @@ class SceneBuilder:
 
         if is_icon(node, opts.icon_max_size):
             el = self._make(node, "icon", parent_id, world)
+            self._tag_component(el, node, comp)
             self._paint(el, node, shape=False)
             el.asset_format = opts.icon_format
             el.asset = "assets/icon_%s.%s" % (sanitize_id(node["id"]), opts.icon_format)
@@ -477,6 +620,7 @@ class SceneBuilder:
 
         if t == "RECTANGLE":
             el = self._make(node, "rect", parent_id, world)
+            self._tag_component(el, node, comp)
             self._paint(el, node, shape=True)
             el.corner_radii = corner_radii(node)
             if el.fill is not None:
@@ -485,6 +629,7 @@ class SceneBuilder:
 
         if t == "ELLIPSE":
             el = self._make(node, "ellipse", parent_id, world)
+            self._tag_component(el, node, comp)
             self._paint(el, node, shape=True)
             if el.fill is not None:
                 self.elements.append(el)
@@ -492,6 +637,7 @@ class SceneBuilder:
 
         if t in CONTAINER_TYPES:
             group = self._make(node, "group", parent_id, world)
+            self._tag_component(group, node, comp)
             self.elements.append(group)
             if t in FILLABLE_CONTAINER_TYPES:
                 bg = self._make(node, "rect", group.id, world)
@@ -500,11 +646,12 @@ class SceneBuilder:
                     bg.id = group.id + ":bg"
                     bg.name = group.name + " (background)"
                     bg.corner_radii = corner_radii(node)
+                    self._tag_component(bg, node, comp, suffix=":bg")
                     self.elements.append(bg)
                 else:
                     self._ids_seen[node["id"]] -= 1  # no background element: give its id back
             for child in node.get("children") or []:
-                self.walk(child, group.id, world)
+                self.walk(child, group.id, world, comp)
             return
 
         # SLICE, STICKY, CONNECTOR, unknown...
@@ -551,6 +698,7 @@ def build_scene(root_node: dict, options: Optional[ExportOptions] = None, file_k
         sb.page_to_scene = origin
         sb.walk(root_node, None, origin)
 
+    detect_overrides(sb.elements)
     scene = Scene(
         page_id=root_node.get("id", ""),
         page_name=root_node.get("name", "Figma Page"),

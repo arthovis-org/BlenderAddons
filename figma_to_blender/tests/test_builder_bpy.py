@@ -99,15 +99,15 @@ class BuilderTests(unittest.TestCase):
         scene, report, _ = self._build("SVG")
         self.assertIn("Page 1", bpy.data.collections)
         coll = bpy.data.collections["Page 1"]
-        self.assertEqual(report.counts, {"group": 5, "rect": 7, "text": 5, "ellipse": 2, "image": 1, "icon": 5})
+        self.assertEqual(report.counts, {"group": 8, "rect": 13, "text": 8, "ellipse": 2, "image": 1, "icon": 5})
         fonts = [o for o in report.objects if o.type == "FONT"]
         meshes = [o for o in report.objects if o.type == "MESH"]
         curves = [o for o in report.objects if o.type == "CURVE"]
         empties = [o for o in report.objects if o.type == "EMPTY"]
-        self.assertEqual(len(fonts), 5)
-        self.assertEqual(len(meshes), 8)  # 7 rects + image plane (ellipses are curves)
+        self.assertEqual(len(fonts), 8)
+        self.assertEqual(len(meshes), 14)  # 13 rects + image plane (ellipses are curves)
         self.assertEqual(len(curves), 5 * 2 + 2)  # fixture SVG has 2 shapes, 5 icons, + 2 ellipse curves
-        self.assertEqual(len(empties), 5 + 5)  # groups + icon roots
+        self.assertEqual(len(empties), 8 + 5)  # groups + icon roots
         for ob in report.objects:
             self.assertIn(coll, ob.users_collection)
             self.assertEqual(len(ob.users_collection), 1)
@@ -587,6 +587,7 @@ class BuilderTests(unittest.TestCase):
         coll = report.collection
         n_objects, n_collections = len(coll.objects), len(bpy.data.collections)
         pointers = {o.name: o.as_pointer() for o in coll.objects}
+        names = sorted(o.name for o in bpy.data.objects)
         self.assertEqual(report.sync["created"], len(scene.elements))  # icon curves are not elements
         self.assertEqual(report.sync["updated"], 0)
         report2 = self._rebuild(scene)
@@ -596,7 +597,7 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(report2.sync, {"created": 0, "updated": len(scene.elements), "moved": 0, "removed": 0})
         self.assertEqual(report2.counts, report.counts)
         self.assertEqual({o.name: o.as_pointer() for o in coll.objects}, pointers)  # same objects, same names
-        self.assertFalse([o for o in bpy.data.objects if o.name.endswith(".001")])
+        self.assertEqual(sorted(o.name for o in bpy.data.objects), names)  # no new ".001" copies
         # materials were reused by name, not duplicated
         self.assertFalse([m for m in bpy.data.materials if m.name.startswith("Figma") and m.name.endswith(".001")])
         self.assertIn("sync: updated %d" % len(scene.elements), report2.summary())
@@ -715,6 +716,144 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(len(report.collection.objects), n)
         self.assertEqual(self._by_name(report2, "Card (background)")["figma_elem_id"], "1:2:bg")
 
+    # -- component instances ------------------------------------------------------
+
+    def _instance_objects(self, report):
+        """(component, instance A, instance B) dicts of path -> object for the fixture's button component."""
+        by_id = {o["figma_elem_id"]: o for o in report.objects if "figma_elem_id" in o}
+        comp = {"": by_id.get("3:1"), ":bg": by_id.get("3:1:bg"), "3:2": by_id.get("3:2"), "3:3": by_id.get("3:3")}
+        a = {"": by_id.get("3:10"), ":bg": by_id.get("3:10:bg"), "3:2": by_id.get("I3:10;3:2"), "3:3": by_id.get("I3:10;3:3")}
+        b = {"": by_id.get("3:20"), ":bg": by_id.get("3:20:bg"), "3:2": by_id.get("I3:20;3:2"), "3:3": by_id.get("I3:20;3:3")}
+        return comp, a, b
+
+    def test_instances_share_component_data(self):
+        scene, report, _ = self._build("SVG")
+        comp, a, b = self._instance_objects(report)
+        self.assertEqual(report.linked, 5)  # 2 instances x 3 elements - 1 override
+        self.assertEqual(report.overrides, ["Button label"])
+        self.assertIn("instances: 5 linked, 1 override(s)", report.summary())
+        # background plane, accent rect and label of instance A share the component's datablocks
+        for path in (":bg", "3:2", "3:3"):
+            self.assertIs(a[path].data, comp[path].data, path)
+            self.assertEqual(comp[path].data.users, 3 if path != "3:3" else 2)
+        # ... and so the same material; the objects themselves are separate and placed per instance
+        self.assertIs(a[":bg"].data.materials[0], comp[":bg"].data.materials[0])
+        self.assertIsNot(a[":bg"], comp[":bg"])
+        self.assertAlmostEqual(comp[":bg"].location.x - 0.170, 0.0, places=6)  # 100 + 70
+        self.assertAlmostEqual(a[":bg"].location.x, 0.330, places=6)  # 260 + 70
+        self.assertEqual(a[":bg"].parent, a[""])
+        self.assertEqual(a["3:3"].parent, a[""])
+        # per-object modifiers exist on every instance with the same settings
+        for ob in (comp[":bg"], a[":bg"], b[":bg"]):
+            self.assertAlmostEqual(self._corner_modifier(ob).width, 0.008, places=6)
+        # the overridden text ("Cancel") has its own text curve; the rest of instance B is linked
+        self.assertIsNot(b["3:3"].data, comp["3:3"].data)
+        self.assertEqual(b["3:3"].data.body, "Cancel")
+        self.assertEqual(comp["3:3"].data.body, "Buy now")
+        self.assertIs(b[":bg"].data, comp[":bg"].data)
+        self.assertIs(b["3:2"].data, comp["3:2"].data)
+        # editing the shared text once shows up in the linked instance
+        comp["3:3"].data.body = "Edited"
+        self.assertEqual(a["3:3"].data.body, "Edited")
+        self.assertEqual(b["3:3"].data.body, "Cancel")
+        # every instance object is a plain object in the import collection (no collection instancing)
+        self.assertEqual(a[""].instance_type, "NONE")
+        self.assertEqual(len(bpy.data.collections["Page 1"].children), 0)
+
+    def test_instances_linking_can_be_disabled(self):
+        scene, report, _ = self._build("SVG", link_instances=False)
+        comp, a, b = self._instance_objects(report)
+        self.assertEqual(report.linked, 0)
+        for path in (":bg", "3:2", "3:3"):
+            self.assertIsNot(a[path].data, comp[path].data)
+            self.assertEqual(comp[path].data.users, 1)
+
+    def test_instances_sync_shared_data_once_and_follows_overrides(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG")
+        comp, a, b = self._instance_objects(report)
+        shared_text, shared_bg = comp["3:3"].data, comp[":bg"].data
+        # Figma edit on the component: new label + wider button -> shared data updated, still shared
+        for eid in ("3:3", "I3:10;3:3"):
+            next(e for e in scene.elements if e.id == eid).text["characters"] = "Buy later"
+        for eid in ("3:1:bg", "3:10:bg", "3:20:bg"):
+            next(e for e in scene.elements if e.id == eid).w = 160.0
+        # instance A now overrides the accent's fill; instance B's label override is reverted to the component's
+        el_a_accent = next(e for e in scene.elements if e.id == "I3:10;3:2")
+        el_a_accent.fill, el_a_accent.override = [1.0, 0.0, 0.0, 1.0], True
+        el_b_label = next(e for e in scene.elements if e.id == "I3:20;3:3")
+        el_b_label.text["characters"], el_b_label.override = "Buy later", False
+        report2 = self._rebuild(scene)
+        self.assertEqual(report2.sync["created"], 0)
+        comp2, a2, b2 = self._instance_objects(report2)
+        self.assertIs(comp2["3:3"], comp["3:3"])
+        self.assertIs(comp2["3:3"].data, shared_text)
+        self.assertEqual(shared_text.body, "Buy later")
+        self.assertIs(a2["3:3"].data, shared_text)
+        self.assertIs(b2["3:3"].data, shared_text)  # override gone: relinked to the shared curve
+        self.assertEqual(shared_text.users, 3)
+        self.assertIs(a2[":bg"].data, shared_bg)
+        self.assertAlmostEqual(shared_bg.vertices[1].co.x - shared_bg.vertices[0].co.x, 0.160, places=6)
+        # the new override got its own mesh and material; the others still share
+        self.assertIsNot(a2["3:2"].data, comp2["3:2"].data)
+        self.assertEqual(tuple(round(c, 2) for c in a2["3:2"].data.materials[0].diffuse_color[:3]), (1.0, 0.0, 0.0))
+        self.assertIs(b2["3:2"].data, comp2["3:2"].data)
+        self.assertEqual(report2.overrides, ["Accent"])
+        self.assertEqual(report2.linked, 5)
+        self.assertFalse([c for c in bpy.data.curves if c.name.endswith(".001") and c.users == 0])
+
+    def test_collection_instance_mode(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG", instance_mode="COLLECTION_INSTANCE")
+        page = bpy.data.collections["Page 1"]
+        comp_coll = next(c for c in page.children if c.get("figma_component") == "3:1")
+        self.assertEqual(comp_coll.name, "Primary button (component)")
+        # the component's four objects live in their own collection, instances are single Empties
+        self.assertEqual(sorted(o["figma_elem_id"] for o in comp_coll.objects), ["3:1", "3:1:bg", "3:2", "3:3"])
+        self.assertEqual(report.counts["group"], 8)  # the instance roots still count as groups
+        self.assertEqual(report.counts["text"], 8 - 2)  # their descendants are not built
+        by_id = {o["figma_elem_id"]: o for o in report.objects if "figma_elem_id" in o}
+        self.assertNotIn("I3:10;3:3", by_id)
+        for iid in ("3:10", "3:20"):
+            inst = by_id[iid]
+            self.assertEqual(inst.type, "EMPTY")
+            self.assertEqual(inst.instance_type, "COLLECTION")
+            self.assertIs(inst.instance_collection, comp_coll)
+            self.assertIn(page, inst.users_collection)
+        # the instanced component lands with its top-left at the instance's top-left: the
+        # component root Empty is at page (100, 720); instance A at (260, 720)
+        comp_root = by_id["3:1"]
+        self.assertAlmostEqual(comp_root.location.x, 0.100, places=6)
+        inst_a = by_id["3:10"]
+        self.assertAlmostEqual(inst_a.location.x, 0.260, places=6)
+        self.assertAlmostEqual(inst_a.location.z, -0.720, places=6)
+        self.assertEqual(tuple(round(v, 6) for v in comp_coll.instance_offset), tuple(round(v, 6) for v in comp_root.location))
+        # what the instance draws: the component's background centre, instanced -> instance A's box centre (330, 740)
+        bg = by_id["3:1:bg"]
+        drawn = inst_a.matrix_world @ (bg.matrix_world.to_translation() - comp_coll.instance_offset)
+        self.assertAlmostEqual(drawn.x, 0.330, places=6)
+        self.assertAlmostEqual(drawn.z, -0.740, places=6)
+        self.assertEqual(report.linked, 2)
+        # the icon instance (component not exported) is still an ordinary icon
+        self.assertEqual(by_id["1:9"].instance_type, "NONE")
+        # switching back to LINKED_DATA on re-import: real objects again, component collection dissolved
+        report2 = self._rebuild(scene, instance_mode="LINKED_DATA")
+        self.assertEqual(by_id["3:10"].instance_type, "NONE")
+        self.assertIsNone(by_id["3:10"].instance_collection)
+        by_id2 = {o["figma_elem_id"]: o for o in report2.objects if "figma_elem_id" in o}
+        self.assertIn("I3:10;3:3", by_id2)
+        self.assertIs(by_id2["I3:10;3:3"].data, by_id2["3:3"].data)
+        self.assertIn(page, by_id2["3:3"].users_collection)
+        self.assertFalse([c for c in page.children if c.get("figma_component")])
+        # ... and forth again: the descendants are parked in the removed collection, the Empty instances
+        report3 = self._rebuild(scene, instance_mode="COLLECTION_INSTANCE")
+        self.assertEqual(by_id["3:10"].instance_type, "COLLECTION")
+        removed = bpy.data.collections["Page 1 (removed)"]
+        self.assertIn(by_id2["I3:10;3:3"], list(removed.objects))
+        self.assertEqual(report3.sync["moved"], 6)
+
     @staticmethod
     def _cancelled(op):
         try:
@@ -737,7 +876,7 @@ class BuilderTests(unittest.TestCase):
             result = bpy.ops.figma.import_bundle()
             self.assertEqual(result, {"FINISHED"})
             self.assertIn("Page 1", bpy.data.collections)
-            self.assertEqual(len([o for o in bpy.data.collections["Page 1"].objects if o.type == "FONT"]), 5)
+            self.assertEqual(len([o for o in bpy.data.collections["Page 1"].objects if o.type == "FONT"]), 8)
             # error reports cancel the operator (bpy raises RuntimeError for ERROR reports in background mode)
             s.bundle_dir = os.path.join(self.tmp, "nope")
             self.assertTrue(self._cancelled(bpy.ops.figma.import_bundle))

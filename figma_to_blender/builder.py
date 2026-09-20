@@ -41,7 +41,7 @@ import bpy
 from mathutils import Matrix, Vector
 
 from . import fonts
-from .scene_model import Element, Scene, load_scene
+from .scene_model import Element, Scene, load_scene, shared_signature
 
 log = logging.getLogger(__name__)
 
@@ -58,6 +58,9 @@ STROKE_MODIFIER_NAME = "Stroke"
 STROKE_NODE_GROUP = "Figma Stroke"  # Geometry Nodes group shared by every stroked object in the .blend
 STROKE_LIFT = 0.0001  # metres the stroke ribbon floats above its face so it never z-fights the fill
 GRADIENT_MAX_STOPS = 32  # Blender's Color Ramp limit
+COMPONENT_PROP = "figma_component"  # custom property on a component's own collection (COLLECTION_INSTANCE mode)
+COMPONENT_SUFFIX = " (component)"
+INSTANCE_MODES = ("LINKED_DATA", "COLLECTION_INSTANCE")
 
 
 @dataclass
@@ -71,6 +74,13 @@ class BuildOptions:
     collection_name: Optional[str] = None
     update_existing: bool = True  # re-sync: update objects of an earlier import of the same page/frame in place
     remove_missing: bool = False  # re-sync: delete objects whose element vanished (default: move to "<root> (removed)")
+    # Component instances: share one mesh / curve / text datablock (and so one material) between a
+    # component's element and the matching, non-overridden element of every instance.
+    link_instances: bool = True
+    # LINKED_DATA: one object per instance element with shared data.  COLLECTION_INSTANCE: the
+    # component's objects go into their own collection and each instance is a single Empty
+    # instancing it (only for components that are part of the export; others fall back).
+    instance_mode: str = "LINKED_DATA"
 
 
 @dataclass
@@ -82,6 +92,8 @@ class BuildReport:
     collection: Optional["bpy.types.Collection"] = None
     # re-sync tallies: created / updated (in place) / moved (to the removed collection) / removed (deleted)
     sync: Dict[str, int] = field(default_factory=lambda: {"created": 0, "updated": 0, "moved": 0, "removed": 0})
+    linked: int = 0  # objects sharing a component's datablock (LINKED_DATA) or instancing its collection
+    overrides: List[str] = field(default_factory=list)  # instance elements that got their own datablock
 
     def bump(self, kind: str) -> None:
         self.counts[kind] = self.counts.get(kind, 0) + 1
@@ -91,6 +103,10 @@ class BuildReport:
         s = "Imported " + (", ".join(parts) if parts else "nothing")
         if any(self.sync.get(k) for k in ("updated", "moved", "removed")):
             s += "; sync: " + ", ".join("%s %d" % (k, self.sync[k]) for k in ("created", "updated", "moved", "removed") if self.sync.get(k))
+        if self.linked or self.overrides:
+            s += "; instances: %d linked" % self.linked
+            if self.overrides:
+                s += ", %d override(s)" % len(self.overrides)
         if self.missing_fonts:
             s += "; fonts not found: " + ", ".join(sorted(set(self.missing_fonts)))
         if self.warnings:
@@ -832,6 +848,13 @@ class SceneBuilder:
         self.objects: Dict[str, "bpy.types.Object"] = {}
         self.existing: Dict[str, "bpy.types.Object"] = {}  # element id -> object of an earlier import
         self._removed_coll: Optional["bpy.types.Collection"] = None
+        # component instances: (component_id, path) -> (signature, datablock) shared by matching elements
+        self._shared: Dict[Tuple[str, str], Tuple[tuple, "bpy.types.ID"]] = {}
+        self._data_done: set = set()  # datablock pointers already written this build (shared data is updated once)
+        self._components: Dict[str, Tuple[Element, int]] = {}  # component id -> (root group element, depth index)
+        self._comp_colls: Dict[str, "bpy.types.Collection"] = {}  # COLLECTION_INSTANCE mode: component id -> collection
+        self._collapsed: set = set()  # ids of instance descendants replaced by a collection instance
+        self._target: Optional["bpy.types.Collection"] = None  # collection receiving the element being built
         self._svg_px_to_m: Optional[float] = None
         self._text_baseline_ratio: Optional[float] = None
         self._font_cache: Dict[Tuple, Optional["bpy.types.VectorFont"]] = {}
@@ -869,7 +892,7 @@ class SceneBuilder:
 
     def _new_object(self, el: Element, name: str, data) -> "bpy.types.Object":
         ob = bpy.data.objects.new(name, data)
-        self.report.collection.objects.link(ob)
+        self._link_to_target(ob)
         self._tag(ob, el)
         self.report.sync["created"] += 1
         self.report.objects.append(ob)
@@ -895,8 +918,121 @@ class SceneBuilder:
         self._tag(ob, el)
         self.report.sync["updated"] += 1
         self.report.objects.append(ob)
-        if ob.name not in self.report.collection.objects:
-            self.report.collection.objects.link(ob)
+        self._link_to_target(ob)
+        return ob
+
+    def _own_collections(self) -> List["bpy.types.Collection"]:
+        """The import collection and its component sub-collections (not the removed one)."""
+        return [self.report.collection] + [c for c in self.report.collection.children if c.get(COMPONENT_PROP)]
+
+    def _link_to_target(self, ob: "bpy.types.Object") -> None:
+        """Put ``ob`` in the collection of the element being built (and only there among ours)."""
+        target = self._target or self.report.collection
+        for c in self._own_collections():
+            if c is not target and ob.name in c.objects:
+                c.objects.unlink(ob)
+        if ob.name not in target.objects:
+            target.objects.link(ob)
+
+    # -- component instances ----------------------------------------------------
+
+    def _share_key(self, el: Element) -> Optional[Tuple[str, str]]:
+        """Slot of ``el`` inside its component when its datablock may be shared."""
+        if not self.opt.link_instances or not el.component_id or el.component_path is None or el.override:
+            return None
+        if el.kind not in ("rect", "ellipse", "text", "image"):
+            return None
+        return (el.component_id, el.component_path)
+
+    def _signature(self, el: Element, asset_path: Optional[str] = None) -> tuple:
+        sig = shared_signature(el)
+        return sig + (file_hash(asset_path),) if asset_path else sig
+
+    def _link_data(self, el: Element, ob: Optional["bpy.types.Object"], sig: tuple):
+        """Shared datablock for ``el`` (``None`` = make a fresh one).
+
+        For a new object the registered datablock of the element's component slot
+        is returned when its signature matches.  An existing object is switched to
+        the shared datablock (its own one is freed), or, when it is an overridden /
+        no longer matching instance element that still shares data, given its own
+        copy so the override does not leak into the other instances.
+        """
+        key = self._share_key(el)
+        entry = self._shared.get(key) if key else None
+        if ob is None:
+            if entry is not None and entry[0] == sig:
+                self.report.linked += 1
+                return entry[1]
+            return None
+        if entry is not None and entry[0] == sig:
+            if ob.data.as_pointer() != entry[1].as_pointer():
+                old = ob.data
+                ob.data = entry[1]
+                self._free_data(old)
+            self.report.linked += 1
+        elif (key is None or entry is not None) and el.component_id and ob.data is not None and ob.data.users > 1:
+            ob.data = ob.data.copy()  # overridden / no longer matching: stop sharing (the first element of a slot keeps its data)
+        return None
+
+    def _register_shared(self, el: Element, ob: "bpy.types.Object", sig: tuple) -> None:
+        key = self._share_key(el)
+        if key is not None and key not in self._shared:
+            self._shared[key] = (sig, ob.data)
+        if el.override and el.name not in self.report.overrides:
+            self.report.overrides.append(el.name)
+        self._data_done.add(ob.data.as_pointer())
+
+    def _written(self, data) -> bool:
+        """True when ``data`` was already written by an earlier element of this build (shared datablock)."""
+        return data is not None and data.as_pointer() in self._data_done
+
+    @staticmethod
+    def _free_data(data) -> None:
+        if data is None or data.users > 0:
+            return
+        for store in (bpy.data.meshes, bpy.data.curves):
+            if data.name in store and store[data.name] == data:
+                store.remove(data)
+                return
+
+    def _component_collection(self, cid: str, el: Element) -> "bpy.types.Collection":
+        coll = self._comp_colls.get(cid)
+        if coll is None:
+            coll = next((c for c in self.report.collection.children if c.get(COMPONENT_PROP) == cid), None)
+            if coll is None:
+                coll = bpy.data.collections.new(el.name + COMPONENT_SUFFIX)
+                self.report.collection.children.link(coll)
+            coll[COMPONENT_PROP] = cid
+            coll["figma_page_id"] = self.scene.page_id
+            self._comp_colls[cid] = coll
+        return coll
+
+    def _target_collection(self, el: Element) -> "bpy.types.Collection":
+        if self.opt.instance_mode == "COLLECTION_INSTANCE" and el.is_component and el.component_id in self._comp_colls:
+            return self._comp_colls[el.component_id]
+        return self.report.collection
+
+    def build_collection_instance(self, el: Element, depth: int, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
+        """An INSTANCE root as an Empty instancing its component's collection.
+
+        The component's objects sit where the component is on the page, so the
+        collection's ``instance_offset`` is the component root's position and the
+        Empty's matrix is ``instance @ component⁻¹`` (times that offset), which
+        puts the component's top-left corner at the instance's.
+        """
+        comp_el, comp_depth = self._components[el.component_id]
+        coll = self._component_collection(el.component_id, comp_el)
+        if ob is None:
+            ob = self._new_object(el, el.name, None)
+        ob.empty_display_type = "PLAIN_AXES"
+        ob.empty_display_size = max(0.01, min(el.w, el.h) * self.opt.scale * 0.25)
+        ob.instance_type = "COLLECTION"
+        ob.instance_collection = coll
+        comp_matrix = self.matrix_for(comp_el, comp_depth, (0.0, 0.0))
+        offset = comp_matrix.to_translation()
+        coll.instance_offset = offset
+        self._place(ob, self.matrix_for(el, depth, (0.0, 0.0)) @ comp_matrix.inverted() @ Matrix.Translation(offset))
+        self.report.linked += 1
         return ob
 
     def _place(self, ob: "bpy.types.Object", matrix: Matrix) -> None:
@@ -993,25 +1129,35 @@ class SceneBuilder:
         if ob is None:
             ob = self._new_object(el, el.name, None)
             ob.empty_display_type = "PLAIN_AXES"
+        elif ob.instance_type == "COLLECTION" and ob.instance_collection is not None and ob.instance_collection.get(COMPONENT_PROP):
+            ob.instance_type = "NONE"  # was a collection instance in an earlier import
+            ob.instance_collection = None
         ob.empty_display_size = max(0.01, min(el.w, el.h) * self.opt.scale * 0.25)
         self._place(ob, self.matrix_for(el, depth, (0.0, 0.0)))
         return ob
 
     def _rect_object(
-        self, el: Element, radii: Optional[List[float]], always_modifier: bool, ob: Optional["bpy.types.Object"] = None
+        self,
+        el: Element,
+        radii: Optional[List[float]],
+        always_modifier: bool,
+        ob: Optional["bpy.types.Object"] = None,
+        shared=None,
     ) -> "bpy.types.Object":
         """Plane object at the element's size (object scale 1) plus a Corner Radius Bevel modifier.
 
         On update the four vertices are moved; the mesh datablock, its material
         slots and every modifier stay.  A mesh the user edited into something
-        else is replaced by a fresh plane (materials carried over).
+        else is replaced by a fresh plane (materials carried over).  ``shared``
+        is a component's mesh to use for a new object instead of a fresh plane.
         """
         s = self.opt.scale
         w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
         if ob is None:
-            ob = self._new_object(el, el.name, plane_mesh(el.name, w, h))
+            ob = self._new_object(el, el.name, shared if shared is not None else plane_mesh(el.name, w, h))
         elif is_plane_mesh(ob.data):
-            set_plane_geometry(ob.data, w, h)
+            if not self._written(ob.data):
+                set_plane_geometry(ob.data, w, h)
         else:
             self.report.warnings.append("Mesh of %r was edited; replaced by a fresh plane" % ob.name)
             old = ob.data
@@ -1026,11 +1172,14 @@ class SceneBuilder:
     def build_shape(self, el: Element, depth: int, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
         s = self.opt.scale
         w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
+        sig = self._signature(el)
+        shared = self._link_data(el, ob, sig)
         if el.kind == "ellipse":
             if ob is None:
-                ob = self._new_object(el, el.name, ellipse_curve(el.name, w, h))
+                ob = self._new_object(el, el.name, shared if shared is not None else ellipse_curve(el.name, w, h))
             elif is_ellipse_curve(ob.data):
-                set_ellipse_points(ob.data, w, h)
+                if not self._written(ob.data):
+                    set_ellipse_points(ob.data, w, h)
             else:
                 self.report.warnings.append("Curve of %r was edited; replaced by a fresh ellipse" % ob.name)
                 old = ob.data
@@ -1040,7 +1189,7 @@ class SceneBuilder:
         else:
             # rect (or an icon / image falling back to its solid fill): always carry
             # the modifier so a radius can be added later without touching the mesh
-            ob = self._rect_object(el, el.corner_radii, True, ob)
+            ob = self._rect_object(el, el.corner_radii, True, ob, shared)
         # planes carry 0..1 UVs; a curve has none, its Generated coordinates span its bound box instead
         mat, is_gradient = self._fill_material(el, "Generated" if ob.type == "CURVE" else "UV")
         self._apply_material(ob.data, mat)
@@ -1050,6 +1199,7 @@ class SceneBuilder:
             del ob["figma_fill_approx"]
         self._apply_stroke(ob, el)
         self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
+        self._register_shared(el, ob, sig)
         return ob
 
     @staticmethod
@@ -1065,9 +1215,11 @@ class SceneBuilder:
     def build_plane(self, el: Element, depth: int, path: str, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
         # plain textured quad; image fills with corner radii get the same Bevel modifier
         radii = el.corner_radii if (el.kind == "image" and el.corner_radii) else None
-        ob = self._rect_object(el, radii, always_modifier=False, ob=ob)
-        mesh = ob.data
         digest = file_hash(path)
+        sig = self._signature(el) + (digest,)  # instances share the plane only for the same picture
+        shared = self._link_data(el, ob, sig)
+        ob = self._rect_object(el, radii, always_modifier=False, ob=ob, shared=shared)
+        mesh = ob.data
         image = self._current_image(mesh) if ob.get("figma_asset_hash") == digest else None
         try:
             if image is None:
@@ -1079,6 +1231,7 @@ class SceneBuilder:
             self._apply_material(mesh, self.materials.flat(el.fill or [0.5, 0.5, 0.5, 1.0], el.opacity))
         self._apply_stroke(ob, el)
         self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
+        self._register_shared(el, ob, sig)
         return ob
 
     # SVG icons ------------------------------------------------------------
@@ -1171,7 +1324,7 @@ class SceneBuilder:
                 ob.name = "%s.%d" % (el.name, i) if len(objs) > 1 else "%s.curve" % el.name
                 for c in list(ob.users_collection):
                     c.objects.unlink(ob)
-                self.report.collection.objects.link(ob)
+                self._link_to_target(ob)
                 ob.parent = empty
                 ob.matrix_parent_inverse = Matrix.Identity(4)
                 ob["figma_id"] = empty["figma_id"]
@@ -1237,9 +1390,12 @@ class SceneBuilder:
         info = el.text or {}
         s = self.opt.scale
         fs = float(info.get("fontSize") or 12.0)
+        sig = self._signature(el)
+        shared = self._link_data(el, ob, sig)
         if ob is None:
-            ob = self._new_object(el, el.name, bpy.data.curves.new(el.name, "FONT"))
+            ob = self._new_object(el, el.name, shared if shared is not None else bpy.data.curves.new(el.name, "FONT"))
         cu = ob.data
+        write = not self._written(cu)  # a shared text curve is written once per build
         body = info.get("characters", "")
         case = info.get("textCase")
         if case == "UPPER":
@@ -1248,38 +1404,36 @@ class SceneBuilder:
             body = body.lower()
         elif case == "TITLE":
             body = body.title()
-        cu.body = body
-        cu.size = fs * s
-        cu.align_x = {"LEFT": "LEFT", "CENTER": "CENTER", "RIGHT": "RIGHT", "JUSTIFIED": "JUSTIFY"}.get(
-            info.get("textAlignHorizontal", "LEFT"), "LEFT"
-        )
-        cu.align_y = {"TOP": "TOP", "CENTER": "CENTER", "BOTTOM": "BOTTOM"}.get(info.get("textAlignVertical", "TOP"), "TOP")
-
         lh = info.get("lineHeightPx")
-        if lh and fs > 0:
-            cu.space_line = float(lh) / fs
-        else:
+        if not (lh and fs > 0):
             lh = fs * 1.2
-            cu.space_line = 1.0
-        ls = info.get("letterSpacing")
-        cu.space_character = max(0.1, 1.0 + float(ls) / (fs * 0.5)) if ls else 1.0
-
         auto = info.get("textAutoResize", "NONE")
-        tb = cu.text_boxes[0]
         anchor_x = 0.0
         if auto == "WIDTH_AND_HEIGHT":
-            tb.width = 0.0  # never wrap auto-width text; align about the anchor instead
             anchor_x = {"CENTER": el.w / 2.0, "RIGHT": el.w}.get(info.get("textAlignHorizontal", "LEFT"), 0.0)
-        else:
-            tb.width = el.w * s
-        tb.height = max(el.h * s, 1e-6)
+        if write:
+            cu.body = body
+            cu.size = fs * s
+            cu.align_x = {"LEFT": "LEFT", "CENTER": "CENTER", "RIGHT": "RIGHT", "JUSTIFIED": "JUSTIFY"}.get(
+                info.get("textAlignHorizontal", "LEFT"), "LEFT"
+            )
+            cu.align_y = {"TOP": "TOP", "CENTER": "CENTER", "BOTTOM": "BOTTOM"}.get(info.get("textAlignVertical", "TOP"), "TOP")
+            cu.space_line = float(lh) / fs if info.get("lineHeightPx") and fs > 0 else 1.0
+            ls = info.get("letterSpacing")
+            cu.space_character = max(0.1, 1.0 + float(ls) / (fs * 0.5)) if ls else 1.0
+            tb = cu.text_boxes[0]
+            if auto == "WIDTH_AND_HEIGHT":
+                tb.width = 0.0  # never wrap auto-width text; align about the anchor instead
+            else:
+                tb.width = el.w * s
+            tb.height = max(el.h * s, 1e-6)
 
         # Font: assign the auto-matched font unless the user picked another one since the last import
         # (``figma_font_file`` remembers what the importer assigned; "" is Blender's built-in font).
         font = self._load_font(info)
         previous = ob.get("figma_font_file")
         if previous is None or previous == font_key(cu.font):
-            if font is not None:
+            if font is not None and write:
                 cu.font = font
             ob["figma_font_file"] = font_key(cu.font)
         if font is None:
@@ -1304,6 +1458,7 @@ class SceneBuilder:
         figma_baseline = -((float(lh) - fs) / 2.0 + TEXT_ASCENT_RATIO * fs) * s  # from box top, y up
         dy = figma_baseline - blender_baseline
         self._place(ob, self.matrix_for(el, depth, (anchor_x, 0.0)) @ Matrix.Translation((0.0, dy, 0.0)))
+        self._register_shared(el, ob, sig)
         return ob
 
     # -- driver ---------------------------------------------------------------
@@ -1325,10 +1480,29 @@ class SceneBuilder:
         return candidates[0] if candidates else None
 
     def _index_existing(self, coll: "bpy.types.Collection") -> None:
-        for ob in coll.objects:
-            eid = ob.get(ELEM_ID_PROP) or legacy_elem_id(ob)
-            if eid and eid not in self.existing:
-                self.existing[eid] = ob
+        for c in [coll] + [c for c in coll.children if c.get(COMPONENT_PROP)]:
+            for ob in c.objects:
+                eid = ob.get(ELEM_ID_PROP) or legacy_elem_id(ob)
+                if eid and eid not in self.existing:
+                    self.existing[eid] = ob
+
+    def _prepare_components(self) -> None:
+        """Index the components in the export and, in COLLECTION_INSTANCE mode, give each its collection."""
+        for depth, el in enumerate(self.scene.elements):
+            if el.is_component and el.kind == "group" and el.component_id and el.component_path == "":
+                self._components.setdefault(el.component_id, (el, depth))
+        if self.opt.instance_mode == "COLLECTION_INSTANCE":
+            for cid, (el, _depth) in self._components.items():
+                self._component_collection(cid, el)
+
+    def _is_collection_instance(self, el: Element) -> bool:
+        return (
+            self.opt.instance_mode == "COLLECTION_INSTANCE"
+            and el.kind == "group"
+            and not el.is_component
+            and el.component_path == ""
+            and el.component_id in self._components
+        )
 
     def build(self) -> BuildReport:
         name = self.opt.collection_name or self.scene.page_name or "Figma Page"
@@ -1346,11 +1520,23 @@ class SceneBuilder:
         svg_ok = svg_importer_available()
         if self.opt.icon_mode == "SVG" and not svg_ok:
             self.report.warnings.append("SVG importer (import_curve.svg) not available; icons imported as planes")
+        if self.opt.instance_mode not in INSTANCE_MODES:
+            self.report.warnings.append("Unknown instance mode %r; using LINKED_DATA" % self.opt.instance_mode)
+            self.opt.instance_mode = "LINKED_DATA"
+        self._prepare_components()
 
         for depth, el in enumerate(self.scene.elements):
+            if el.parent in self._collapsed:  # inside a collection instance: drawn by the instanced collection
+                self._collapsed.add(el.id)
+                continue
             existing = self.existing.pop(el.id, None)
+            self._target = self._target_collection(el)
             try:
-                ob = self._build_element(el, depth, svg_ok, existing)
+                if self._is_collection_instance(el):
+                    ob = self.build_collection_instance(el, depth, self._reuse(existing, el, "EMPTY"))
+                    self._collapsed.add(el.id)
+                else:
+                    ob = self._build_element(el, depth, svg_ok, existing)
             except Exception as e:  # noqa: BLE001 - keep going, report the failure
                 log.exception("Failed to build %s", el.id)
                 self.report.warnings.append("Failed to build %r (%s): %s" % (el.name, el.kind, e))
@@ -1360,10 +1546,14 @@ class SceneBuilder:
             self.objects[el.id] = ob
             self._parent(ob, el)
             self.report.bump(el.kind)
+        self._target = None
 
-        for ob in list(self.existing.values()):  # elements that vanished from Figma
+        for ob in list(self.existing.values()):  # elements that vanished from Figma (or collapsed into an instance)
             self._retire(ob)
         self.existing.clear()
+        for c in list(coll.children):  # component collections left empty after a mode change
+            if c.get(COMPONENT_PROP) and not c.objects and not c.children and c not in self._comp_colls.values():
+                bpy.data.collections.remove(c)
         return self.report
 
     def _build_element(

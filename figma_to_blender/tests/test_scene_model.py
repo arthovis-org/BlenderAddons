@@ -95,7 +95,7 @@ class BuildSceneTests(unittest.TestCase):
         counts = {}
         for e in self.scene.elements:
             counts[e.kind] = counts.get(e.kind, 0) + 1
-        self.assertEqual(counts, {"group": 5, "rect": 7, "text": 5, "ellipse": 2, "image": 1, "icon": 5})
+        self.assertEqual(counts, {"group": 8, "rect": 13, "text": 8, "ellipse": 2, "image": 1, "icon": 5})
         self.assertEqual(self.scene.page_name, "Page 1")
         self.assertEqual(self.scene.file_key, "KEY")
 
@@ -407,6 +407,81 @@ class FrameRootTests(unittest.TestCase):
         self.assertEqual(loaded.page_name, "Card")
         # bundles written before root_type existed default to a page
         self.assertEqual(scene_model.scene_from_dict({"page_id": "0:1", "elements": []}).root_type, "CANVAS")
+
+
+class ComponentInstanceTests(unittest.TestCase):
+    """COMPONENT / INSTANCE nodes: shared ids ("paths") inside the component and override detection."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scene = build_scene(load_page(), ExportOptions(), file_key="KEY")
+
+    def test_component_path_derivation(self):
+        cp = scene_model.component_path
+        self.assertEqual(cp("3:1", "3:1"), "")  # the root itself
+        self.assertEqual(cp("3:3", "3:1"), "3:3")  # a component's own child keeps its id
+        self.assertEqual(cp("I3:10;3:3", "3:10"), "3:3")  # instance child -> component child id
+        self.assertEqual(cp("I3:10;3:3#1", "3:10"), "3:3")  # duplicate suffix ignored
+        self.assertEqual(cp("I3:10;4:1;4:2", "3:10"), "I4:1;4:2")  # nested instance inside the component
+        self.assertEqual(cp("7:7", "3:10"), "7:7")  # not an instance id: unchanged
+
+    def test_component_and_instances_are_tagged(self):
+        comp = by_id(self.scene, "3:1")
+        self.assertTrue(comp.is_component)
+        self.assertEqual((comp.component_id, comp.component_path), ("3:1", ""))
+        self.assertEqual(by_id(self.scene, "3:1:bg").component_path, ":bg")
+        self.assertEqual(by_id(self.scene, "3:3").component_path, "3:3")
+        inst = by_id(self.scene, "3:10")
+        self.assertFalse(inst.is_component)
+        self.assertEqual((inst.component_id, inst.component_path), ("3:1", ""))
+        self.assertEqual(by_id(self.scene, "3:10:bg").component_path, ":bg")
+        self.assertEqual(by_id(self.scene, "I3:10;3:3").component_path, "3:3")
+        self.assertEqual(by_id(self.scene, "I3:20;3:2").component_path, "3:2")
+        # the icon instance of a component that is not in the export is tagged too
+        icon = by_id(self.scene, "1:9")
+        self.assertEqual((icon.component_id, icon.component_path, icon.is_component), ("9:1", "", False))
+        # elements outside any component carry nothing
+        self.assertIsNone(by_id(self.scene, "1:4").component_id)
+        self.assertNotIn("component_id", by_id(self.scene, "1:4").to_dict())
+
+    def test_override_detection(self):
+        # instance A matches the component exactly; instance B's label text differs
+        for eid in ("3:10", "3:10:bg", "I3:10;3:2", "I3:10;3:3", "3:20", "3:20:bg", "I3:20;3:2"):
+            self.assertFalse(by_id(self.scene, eid).override, eid)
+        self.assertTrue(by_id(self.scene, "I3:20;3:3").override)
+        self.assertEqual(by_id(self.scene, "I3:20;3:3").text["characters"], "Cancel")
+        # signatures ignore transform / parent / name, compare data only
+        a, b = by_id(self.scene, "I3:10;3:2"), by_id(self.scene, "3:2")
+        self.assertNotEqual((a.x, a.parent), (b.x, b.parent))
+        self.assertEqual(scene_model.shared_signature(a), scene_model.shared_signature(b))
+        self.assertNotEqual(scene_model.shared_signature(by_id(self.scene, "I3:20;3:3")), scene_model.shared_signature(by_id(self.scene, "3:3")))
+
+    def test_override_from_figma_overrides_field_and_without_component(self):
+        page = load_page()
+        comp_node = find_node(page, "3:1")
+        page["children"].remove(comp_node)  # component not exported: the first instance is the master
+        inst_a = find_node(page, "3:10")
+        inst_a["overrides"] = [{"id": "I3:10;3:2", "overriddenFields": ["fills"]}]  # Figma says: fill overridden
+        find_node(page, "I3:20;3:2")["size"] = {"x": 4, "y": 30}  # instance B: taller accent
+        scene = build_scene(page, ExportOptions())
+        self.assertFalse(any(e.is_component for e in scene.elements))
+        self.assertTrue(by_id(scene, "I3:10;3:2").override)  # from the overrides array
+        self.assertFalse(by_id(scene, "I3:10;3:3").override)  # first instance is the reference
+        self.assertTrue(by_id(scene, "I3:20;3:2").override)  # differs from instance A
+        self.assertTrue(by_id(scene, "I3:20;3:3").override)  # "Cancel" vs "Buy now"
+        self.assertFalse(by_id(scene, "3:20:bg").override)
+        # a non-data override (name / position) does not count
+        page = load_page()
+        find_node(page, "3:10")["overrides"] = [{"id": "I3:10;3:3", "overriddenFields": ["name", "relativeTransform"]}]
+        self.assertFalse(by_id(build_scene(page, ExportOptions()), "I3:10;3:3").override)
+
+    def test_roundtrip_keeps_component_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_scene(self.scene, tmp)
+            loaded = load_scene(tmp)
+        el = by_id(loaded, "I3:20;3:3")
+        self.assertEqual((el.component_id, el.component_path, el.override, el.is_component), ("3:1", "3:3", True, False))
+        self.assertTrue(by_id(loaded, "3:1").is_component)
 
 
 class FakeClient:
