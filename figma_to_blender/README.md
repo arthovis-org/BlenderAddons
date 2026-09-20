@@ -1,6 +1,6 @@
 # Figma to Blender
 
-A Blender add-on that imports a **Figma page as editable 3D UI**: text becomes Blender text
+A Blender add-on that imports a **Figma page, or a single frame, as editable 3D UI**: text becomes Blender text
 objects, rectangles become planes with a *Corner Radius* Bevel modifier, ellipses become
 filled curves, icons become SVG curves (or textured planes), image fills become textured
 planes, and Figma frames/groups become parented Empties, so you can grab a whole card or menu
@@ -14,7 +14,7 @@ and the same pure-Python core also runs as a CLI so a page can be exported once 
 
 ## Install
 
-Download [`figma_to_blender-v0.1.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.1.0.zip)
+Download [`figma_to_blender-v0.2.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.2.0.zip)
 from the repo's `releases/` folder. Alternatively, every push and pull request to [this repo](../README.md) runs the
 [Build add-ons](../.github/workflows/build-addon.yml) workflow, which runs the tests and uploads
 the zip as the `figma_to_blender` artifact (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
@@ -45,7 +45,9 @@ least view access to the file you import.
 Open the 3D Viewport sidebar (`N`) ▸ **Figma** tab.
 
 1. Paste the file URL (`https://www.figma.com/design/<key>/...`) or bare file key.
-2. **Fetch pages**, then pick a page from the dropdown.
+2. **Fetch pages**, then pick a page from the dropdown. To import only one frame of that page,
+   see [Import a single frame](#import-a-single-frame) below; leave **Frame** at *(whole page)*
+   and **Node URL / ID** empty to import the whole page.
 3. Choose options:
    - **Icons**: *SVG curves* or *Image planes* (see below).
    - **Orientation**: *Upright (XZ)*, the UI faces -Y like the front view, or *Flat (XY)*.
@@ -55,12 +57,38 @@ Open the 3D Viewport sidebar (`N`) ▸ **Figma** tab.
    - **Corner segments**: segments per rounded corner on the *Corner Radius* Bevel modifier
      (default 8; change it later per object in the modifier itself).
    - **Icon max size**, **Raster scale**, **Center at origin**.
-4. **Import page**. A new collection named after the page appears, with one Empty per Figma
-   frame/group and children parented to it. Every object carries `figma_id`, `figma_type`,
+4. **Import**. A new collection named after the page (or frame) appears, with one Empty per
+   Figma frame/group and children parented to it. Every object carries `figma_id`, `figma_type`,
    `figma_name` custom properties; text whose font was not found gets `figma_font`.
 
-**Offline bundle** box: *Export bundle to folder* fetches without building; *Import bundle*
-builds from a folder written earlier by the add-on or the CLI.
+**Offline bundle** box: *Export bundle to folder* fetches the same page/frame/node without
+building; *Import bundle* builds from a folder written earlier by the add-on or the CLI.
+
+## Import a single frame
+
+You do not have to import a whole page: any frame (or section, group, component, even a single
+text or rectangle) can be imported on its own. Two ways, both in the **Figma file** box of the
+panel:
+
+1. **Frame dropdown.** After **Fetch pages** and picking the page, click **Fetch frames**. The
+   **Frame** dropdown now lists the page's top-level layers (the first entry, *(whole page)*,
+   imports everything as before). Pick a frame and press **Import**.
+2. **Node URL / ID.** In Figma, select the frame and use *Copy link to selection*
+   (right-click ▸ *Copy/Paste as* ▸ *Copy link to selection*, or `Ctrl/Cmd+L`). Paste the link
+   into **Node URL / ID (optional)** and press **Import**. Figma writes the node id as
+   `node-id=12-345` in URLs; the add-on converts it to `12:345`. A bare id (`12:345`, as shown
+   by Figma's dev mode or the CLI's `--list-frames`) works too. This field works for nodes at
+   any depth, not only top-level frames, and while it is non-empty it overrides both dropdowns.
+   An unreadable value stops the import with an error instead of falling back to the page.
+
+The imported frame gets its own collection named after it. Its **top-left corner is placed at
+the origin** (`0, 0`) and its children move with it, so the frame's position on the Figma page
+does not leak into Blender; the frame's own rotation is kept, so a tilted frame imports tilted,
+just as on the canvas. The frame's fill and corner radius become its background plane like any
+other frame. *Center at origin* still applies afterwards if you prefer the frame centred.
+*Export bundle to folder* honours the same selection; in `scene.json` the root node is recorded
+in `page_id` / `page_name` (kept for compatibility) plus `root_type` (`CANVAS` for a page,
+`FRAME`, `SECTION`, ... otherwise).
 
 The operator prints a summary (counts per kind, fonts not found, warnings) to the status bar
 and full warnings to the system console.
@@ -74,7 +102,15 @@ export FIGMA_TOKEN=figd_...
 python -m figma_to_blender.cli --file https://www.figma.com/design/<key>/Name --list-pages
 python -m figma_to_blender.cli --file <key> --page "Page 1" --out ./bundle \
     --icon-format svg --raster-scale 2 --icon-max-size 128
+
+# single frame: list a page's top-level frames (id, type, name), then export one by id or by URL
+python -m figma_to_blender.cli --file <key> --page "Page 1" --list-frames
+python -m figma_to_blender.cli --file <key> --node 12:345 --out ./card
+python -m figma_to_blender.cli --file <key> --node "https://www.figma.com/design/<key>/Name?node-id=12-345" --out ./card
 ```
+
+`--node` and `--page` are mutually exclusive; `--node` skips the page listing entirely and puts
+the node's top-left corner at the origin, exactly like the add-on's **Node URL / ID** field.
 
 Then in Blender: *Offline bundle ▸ Import bundle* pointing at `./bundle`, or from a script:
 
@@ -114,10 +150,12 @@ Figma REST API ──► figma_api.py ──► scene_model.py ──► scene.j
                    (urllib only)     (pure Python)        (the "bundle")          (bpy)
 ```
 
-- `GET /v1/files/{key}?depth=1` lists pages; `GET /v1/files/{key}/nodes?ids=<page>&geometry=paths`
-  fetches the tree with `size` + `relativeTransform`, which are composed down from the page
-  root so nested and rotated frames land where Figma shows them (falls back to
-  `absoluteBoundingBox` when missing).
+- `GET /v1/files/{key}?depth=1` lists pages; `GET /v1/files/{key}/nodes?ids=<page>&depth=1`
+  lists a page's top-level frames; `GET /v1/files/{key}/nodes?ids=<page-or-frame>&geometry=paths`
+  fetches the tree with `size` + `relativeTransform`, which are composed down from the root
+  so nested and rotated frames land where Figma shows them (falls back to
+  `absoluteBoundingBox` when missing). For a single-frame import the root's translation is
+  cancelled so its corner sits at the origin (`scene_model.root_origin_matrix`).
 - Icons and image fills are rendered by `GET /v1/images/{key}` in batches of 40 with retry/backoff
   on 429; a failed render is logged and skipped, never fatal.
 - `scene.json` is a flat draw-ordered list of `text | rect | ellipse | icon | image | group`
@@ -144,7 +182,7 @@ it measures the importer's px→metre factor once, then scales each icon so the 
 matches the node size exactly (falling back to bounding-box fitting for SVGs without a
 viewBox). If the importer is unavailable, icons fall back to planes with a warning.
 
-## Limitations (v0.1)
+## Limitations (v0.2)
 
 - Gradients are approximated by a single averaged colour (`fill_approx` flag / `figma_fill_approx`
   property); image fills on shapes other than the first fill are ignored.
@@ -180,8 +218,9 @@ python tools/build_zip.py --addon figma_to_blender          # the same zip CI up
 
 The bpy tests build the fixture page in both icon modes and assert object counts, types,
 positions, rotation, parenting, materials, the SVG icon's bounding box, the *Corner Radius*
-Bevel modifier (width, segments, per-corner vertex weights, evaluated vertex count) and the
-ellipse curve (2D, fill BOTH, dimensions).
+Bevel modifier (width, segments, per-corner vertex weights, evaluated vertex count), the
+ellipse curve (2D, fill BOTH, dimensions) and a single-frame import (collection named after the
+frame, background plane cornered at the origin, only the subtree built).
 
 ## License
 
