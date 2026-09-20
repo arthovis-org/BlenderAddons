@@ -1,4 +1,4 @@
-"""Figma to Blender: import a Figma page as editable 3D UI.
+"""Figma to Blender: import a Figma page or a single frame as editable 3D UI.
 
 The package doubles as a plain Python library / CLI (``python -m
 figma_to_blender.cli``), so ``bpy`` is imported defensively and the Blender UI
@@ -8,10 +8,10 @@ classes are only defined when it is available.
 bl_info = {
     "name": "Figma to Blender",
     "author": "arthovis-org",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 0, 0),
     "location": "3D Viewport > Sidebar (N) > Figma",
-    "description": "Import a Figma page as editable 3D UI: text, rounded shapes, icons (SVG curves or planes) and images",
+    "description": "Import a Figma page or a single frame as editable 3D UI: text, rounded shapes, icons (SVG curves or planes) and images",
     "doc_url": "https://github.com/arthovis-org/BlenderAddons",
     "tracker_url": "https://github.com/arthovis-org/BlenderAddons/issues",
     "category": "Import-Export",
@@ -32,7 +32,7 @@ if bpy is not None:
     from bpy.types import AddonPreferences, Operator, Panel, PropertyGroup
 
     from . import builder, scene_model
-    from .figma_api import FigmaClient, FigmaError, parse_file_key
+    from .figma_api import FigmaClient, FigmaError, parse_file_key, parse_node_id
 
     ADDON_ID = __package__
 
@@ -71,9 +71,53 @@ if bpy is not None:
             return _page_items
         return [("NONE", "(fetch pages first)", "Click 'Fetch pages' to list the file's pages")]
 
+    WHOLE_PAGE = "PAGE"
+    # First entry is fixed; 'Fetch frames' appends the selected page's top-level layers after it.
+    _frame_items = [(WHOLE_PAGE, "(whole page)", "Import every top-level layer of the selected page")]
+
+    def _frame_enum_items(self, context):
+        return _frame_items
+
+    def _on_page_changed(self, context):
+        # The frame list belongs to the page it was fetched for.
+        del _frame_items[1:]
+        if self.frame != WHOLE_PAGE:
+            self.frame = WHOLE_PAGE
+
+    def resolve_target(s: "FIGMA_settings"):
+        """Return ``(node_id, label)`` for what the panel says to import.
+
+        A non-empty *Node URL / ID* wins over the dropdowns; otherwise the
+        selected frame, or the whole page when *(whole page)* is chosen.
+        Raises ``ValueError`` with a user-facing message.
+        """
+        ref = (s.node_ref or "").strip()
+        if ref:
+            node_id = parse_node_id(ref)
+            if node_id is None:
+                raise ValueError(
+                    "Could not read a node id from %r. Paste a Figma 'Copy link to selection' URL "
+                    "(...?node-id=12-345) or an id like 12:345, or clear the field to use the dropdowns" % ref
+                )
+            return node_id, "node %s" % node_id
+        if not _page_items or s.page == "NONE":
+            raise ValueError("Fetch pages and pick one first, or paste a node URL / ID")
+        if s.frame != WHOLE_PAGE and len(_frame_items) > 1:
+            return s.frame, "frame %s" % s.frame
+        return s.page, "page %s" % s.page
+
     class FIGMA_settings(PropertyGroup):
         file_url: StringProperty(name="File URL / key", description="Figma file URL (…/design/<key>/…) or bare file key")
-        page: EnumProperty(name="Page", items=_page_enum_items)
+        page: EnumProperty(name="Page", items=_page_enum_items, update=_on_page_changed)
+        frame: EnumProperty(
+            name="Frame",
+            description="Top-level frame of the selected page to import on its own; '(whole page)' imports everything. Click 'Fetch frames' to fill the list",
+            items=_frame_enum_items,
+        )
+        node_ref: StringProperty(
+            name="Node URL / ID (optional)",
+            description="Import exactly this node instead of the page/frame above: paste Figma's 'Copy link to selection' URL (…?node-id=12-345) or a node id like 12:345",
+        )
         icon_mode: EnumProperty(
             name="Icons",
             items=[
@@ -165,21 +209,54 @@ if bpy is not None:
             self.report({"INFO"}, "Found %d page(s)" % len(pages))
             return {"FINISHED"}
 
+    class FIGMA_OT_fetch_frames(Operator):
+        bl_idname = "figma.fetch_frames"
+        bl_label = "Fetch frames"
+        bl_description = "List the top-level frames of the selected page so one of them can be imported on its own"
+
+        def execute(self, context):
+            s = context.scene.figma_to_blender
+            if not _page_items or s.page == "NONE":
+                self.report({"ERROR"}, "Fetch pages and pick one first")
+                return {"CANCELLED"}
+            client = _client(self, context)
+            if client is None:
+                return {"CANCELLED"}
+            try:
+                key = parse_file_key(s.file_url)
+                frames = client.list_top_level_frames(key, s.page)
+            except (ValueError, FigmaError) as e:
+                self.report({"ERROR"}, str(e))
+                return {"CANCELLED"}
+            del _frame_items[1:]
+            for fr in frames:
+                kind = (fr.get("type") or "node").replace("_", " ").title()
+                _frame_items.append((fr["id"], fr["name"], "%s %s" % (kind, fr["id"])))
+            s.frame = WHOLE_PAGE
+            if not frames:
+                self.report({"WARNING"}, "Page has no top-level layers")
+                return {"CANCELLED"}
+            self.report({"INFO"}, "Found %d top-level layer(s)" % len(frames))
+            return {"FINISHED"}
+
     class _ExportMixin:
         def _export(self, context, out_dir):
             s = context.scene.figma_to_blender
+            try:
+                node_id, label = resolve_target(s)
+                key = parse_file_key(s.file_url)
+            except ValueError as e:
+                self.report({"ERROR"}, str(e))
+                return None
             client = _client(self, context)
             if client is None:
-                return None
-            if not _page_items or s.page == "NONE":
-                self.report({"ERROR"}, "Fetch pages and pick one first")
                 return None
             wm = context.window_manager
             wm.progress_begin(0, 100)
             try:
-                key = parse_file_key(s.file_url)
                 wm.progress_update(10)
-                scene = scene_model.export_bundle(client, key, s.page, out_dir, export_options(s))
+                print("[figma_to_blender] fetching %s of file %s" % (label, key))
+                scene = scene_model.export_bundle(client, key, node_id, out_dir, export_options(s))
                 wm.progress_update(90)
             except (ValueError, FigmaError, OSError) as e:
                 self.report({"ERROR"}, str(e))
@@ -194,8 +271,11 @@ if bpy is not None:
 
     class FIGMA_OT_import_page(_ExportMixin, Operator):
         bl_idname = "figma.import_page"
-        bl_label = "Import page"
-        bl_description = "Fetch the selected page from Figma and build it as 3D objects"
+        bl_label = "Import"
+        bl_description = (
+            "Fetch the selected page, frame or node from Figma and build it as 3D objects in a new collection "
+            "named after it (a frame is placed with its top-left corner at the origin)"
+        )
 
         def execute(self, context):
             s = context.scene.figma_to_blender
@@ -215,7 +295,7 @@ if bpy is not None:
     class FIGMA_OT_export_bundle(_ExportMixin, Operator):
         bl_idname = "figma.export_bundle"
         bl_label = "Export bundle to folder"
-        bl_description = "Fetch the selected page and write scene.json + assets without building objects"
+        bl_description = "Fetch the selected page, frame or node and write scene.json + assets without building objects"
 
         def execute(self, context):
             s = context.scene.figma_to_blender
@@ -271,6 +351,10 @@ if bpy is not None:
             row = box.row(align=True)
             row.operator(FIGMA_OT_fetch_pages.bl_idname, icon="FILE_REFRESH")
             box.prop(s, "page")
+            row = box.row(align=True)
+            row.operator(FIGMA_OT_fetch_frames.bl_idname, icon="FILE_REFRESH")
+            box.prop(s, "frame")
+            box.prop(s, "node_ref")
 
             box = layout.box()
             box.label(text="Import options", icon="PREFERENCES")
@@ -297,6 +381,7 @@ if bpy is not None:
         FIGMA_preferences,
         FIGMA_settings,
         FIGMA_OT_fetch_pages,
+        FIGMA_OT_fetch_frames,
         FIGMA_OT_import_page,
         FIGMA_OT_export_bundle,
         FIGMA_OT_import_bundle,
