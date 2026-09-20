@@ -5,3 +5,4 @@ __pycache__/
 bundle/
 /render.png
 dist/
+!/releases/**/*.zip

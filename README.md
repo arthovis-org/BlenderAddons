@@ -13,7 +13,9 @@ add-on (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
 
 ## Install an add-on
 
-Download `<name>.zip` from the latest workflow run (or build it locally, standard library only):
+Download the latest zip from [`releases/`](releases/) (for example
+[`figma_to_blender-v0.1.0.zip`](releases/figma_to_blender/figma_to_blender-v0.1.0.zip)), grab
+`<name>.zip` from the latest workflow run, or build it locally (standard library only):
 
 ```sh
 python tools/build_zip.py --addon figma_to_blender   # -> dist/figma_to_blender.zip

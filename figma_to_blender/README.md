@@ -14,7 +14,8 @@ and the same pure-Python core also runs as a CLI so a page can be exported once 
 
 ## Install
 
-Grab `figma_to_blender.zip`: every push and pull request to [this repo](../README.md) runs the
+Download [`figma_to_blender-v0.1.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.1.0.zip)
+from the repo's `releases/` folder. Alternatively, every push and pull request to [this repo](../README.md) runs the
 [Build add-ons](../.github/workflows/build-addon.yml) workflow, which runs the tests and uploads
 the zip as the `figma_to_blender` artifact (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
 To build it locally (standard library only, from the repo root):
