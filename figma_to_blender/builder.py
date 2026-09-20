@@ -20,12 +20,15 @@ parameter is baked into geometry: rectangles are plain 4-vertex planes with a
 "Corner Radius" Bevel modifier (per-corner radii as vertex bevel weights),
 ellipses are 2D Bezier curves, SVG icons keep the importer's curves and are
 sized through the parent Empty's transform, rotation lives on the object and
-colour lives in the material.
+colour lives in the material.  Gradients are shader nodes (Mapping -> Gradient
+Texture -> Color Ramp) and strokes are a "Figma Stroke" Geometry Nodes
+modifier that outlines the evaluated shape, so nothing is baked.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
 import os
@@ -51,6 +54,10 @@ TEXT_ASCENT_RATIO = 0.8  # approximate ascender / font size used to place Figma 
 MANAGED_PROP = "figma_managed"  # custom property marking materials the importer created (re-sync may swap them)
 ELEM_ID_PROP = "figma_elem_id"  # exact scene element id (``figma_id`` plus ``:bg`` / ``#n`` suffixes) used by re-sync
 REMOVED_SUFFIX = " (removed)"  # sub-collection receiving objects whose Figma element disappeared
+STROKE_MODIFIER_NAME = "Stroke"
+STROKE_NODE_GROUP = "Figma Stroke"  # Geometry Nodes group shared by every stroked object in the .blend
+STROKE_LIFT = 0.0001  # metres the stroke ribbon floats above its face so it never z-fights the fill
+GRADIENT_MAX_STOPS = 32  # Blender's Color Ramp limit
 
 
 @dataclass
@@ -184,6 +191,15 @@ class MaterialCache:
             self._image[key] = mat
         return mat
 
+    def gradient(self, gradient: dict, alpha: float, coords: str = "UV") -> "bpy.types.Material":
+        """One material per distinct gradient (type, stops, handles, opacity, coordinate source)."""
+        digest = hashlib.md5(json.dumps([gradient, round(alpha, 4), coords], sort_keys=True).encode("utf-8")).hexdigest()[:10]
+        name = "Figma gradient %s" % digest
+        mat = self._existing(name)
+        if mat is None:
+            mat = make_gradient_material(name, gradient, alpha, coords)
+        return mat
+
 
 def make_flat_material(name: str, color, alpha: float = 1.0) -> "bpy.types.Material":
     """Unlit (emission) material of a single colour, optionally transparent."""
@@ -209,6 +225,355 @@ def make_image_material(name: str, image: "bpy.types.Image", alpha: float = 1.0)
     _link_with_alpha(nodes, links, em, out, alpha_socket=tex.outputs["Alpha"], alpha_value=alpha)
     set_material_blend(mat, 0.5)  # always blended: the texture carries alpha
     return mat
+
+
+def gradient_mapping(gradient: dict) -> Tuple[Tuple[float, float, float], float, Tuple[float, float, float]]:
+    """``(location, z_rotation, scale)`` for a *Texture*-type Mapping node.
+
+    Figma handles are normalised to the node box with y down; the plane's UVs
+    (and a curve's Generated coordinates) span the same box with y up, so a
+    handle ``(x, y)`` sits at UV ``(x, 1 - y)``.  A Texture mapping applies the
+    inverse transform, so with location = handle 0, rotation = the angle of
+    handle 0 -> handle 1 and scale = the handle distances, the output X runs
+    0..1 from handle 0 to handle 1 (the gradient axis) and Y across it.
+    """
+    handles = gradient.get("handles") or []
+    uv = [(float(h[0]), 1.0 - float(h[1])) for h in handles]
+    while len(uv) < 2:
+        uv.append((0.5, 0.0) if len(uv) == 1 else (0.5, 1.0))
+    (x0, y0), (x1, y1) = uv[0], uv[1]
+    dx, dy = x1 - x0, y1 - y0
+    length = math.hypot(dx, dy)
+    rot = math.atan2(dy, dx) if length > 1e-9 else 0.0
+    length = length if length > 1e-9 else 1.0
+    across = length
+    if len(uv) > 2 and gradient.get("type") in ("GRADIENT_RADIAL", "GRADIENT_DIAMOND"):
+        across = math.hypot(uv[2][0] - x0, uv[2][1] - y0) or length
+    return (x0, y0, 0.0), rot, (length, across, 1.0)
+
+
+def gradient_average(gradient: dict) -> List[float]:
+    stops = gradient.get("stops") or []
+    if not stops:
+        return [0.5, 0.5, 0.5, 1.0]
+    n = float(len(stops))
+    return [sum(float(st["color"][i]) for st in stops) / n for i in range(4)]
+
+
+def make_gradient_material(name: str, gradient: dict, alpha: float = 1.0, coords: str = "UV") -> "bpy.types.Material":
+    """Unlit material reproducing a Figma gradient with shader nodes.
+
+    Texture Coordinate (UV, or Generated for curve objects) -> Mapping (from the
+    handle positions, see :func:`gradient_mapping`) -> Gradient Texture
+    (LINEAR / SPHERICAL / RADIAL; a diamond is |x| + |y| from math nodes) ->
+    Color Ramp with the stops (colour + alpha) -> Emission.  Everything stays
+    editable: move the handles in the Mapping node, recolour stops in the ramp.
+    """
+    mat = _new_managed_material(name)
+    nodes, links, em, out = _emission_output(mat)
+    gtype = gradient.get("type", "GRADIENT_LINEAR")
+
+    tc = nodes.new("ShaderNodeTexCoord")
+    tc.location = (-1100, 0)
+    mp = nodes.new("ShaderNodeMapping")
+    mp.vector_type = "TEXTURE"
+    mp.location = (-900, 0)
+    loc, rot, scl = gradient_mapping(gradient)
+    mp.inputs["Location"].default_value = loc
+    mp.inputs["Rotation"].default_value = (0.0, 0.0, rot)
+    mp.inputs["Scale"].default_value = scl
+    links.new(tc.outputs["Generated" if coords == "Generated" else "UV"], mp.inputs["Vector"])
+
+    if gtype == "GRADIENT_DIAMOND":
+        # |x| + |y| == 1 on the diamond through the handles (no Gradient Texture type for it)
+        absn = nodes.new("ShaderNodeVectorMath")
+        absn.operation = "ABSOLUTE"
+        absn.location = (-700, 0)
+        links.new(mp.outputs[0], absn.inputs[0])
+        sep = nodes.new("ShaderNodeSeparateXYZ")
+        sep.location = (-550, 0)
+        links.new(absn.outputs[0], sep.inputs[0])
+        add = nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        add.location = (-400, 0)
+        links.new(sep.outputs["X"], add.inputs[0])
+        links.new(sep.outputs["Y"], add.inputs[1])
+        fac = add.outputs[0]
+    else:
+        gt = nodes.new("ShaderNodeTexGradient")
+        gt.location = (-700, 0)
+        gt.gradient_type = {"GRADIENT_RADIAL": "SPHERICAL", "GRADIENT_ANGULAR": "RADIAL"}.get(gtype, "LINEAR")
+        links.new(mp.outputs[0], gt.inputs["Vector"])
+        fac = gt.outputs["Fac"]
+        if gtype == "GRADIENT_RADIAL":
+            inv = nodes.new("ShaderNodeMath")  # SPHERICAL is 1 at the centre; Figma's position 0 is the centre
+            inv.operation = "SUBTRACT"
+            inv.location = (-450, 0)
+            inv.inputs[0].default_value = 1.0
+            links.new(fac, inv.inputs[1])
+            fac = inv.outputs[0]
+        elif gtype == "GRADIENT_ANGULAR":
+            # RADIAL is atan2 / 2pi + 0.5, counter-clockwise from -X; Figma sweeps clockwise from handle 1
+            sub = nodes.new("ShaderNodeMath")
+            sub.operation = "SUBTRACT"
+            sub.location = (-550, 0)
+            sub.inputs[0].default_value = 0.5
+            links.new(fac, sub.inputs[1])
+            frac = nodes.new("ShaderNodeMath")
+            frac.operation = "FRACT"
+            frac.location = (-400, 0)
+            links.new(sub.outputs[0], frac.inputs[0])
+            fac = frac.outputs[0]
+
+    ramp = nodes.new("ShaderNodeValToRGB")
+    ramp.location = (-250, 0)
+    stops = list(gradient.get("stops") or [])[:GRADIENT_MAX_STOPS]
+    if len(gradient.get("stops") or []) > GRADIENT_MAX_STOPS:
+        log.warning("Gradient %s has %d stops; Blender ramps hold %d", name, len(gradient["stops"]), GRADIENT_MAX_STOPS)
+    elements = ramp.color_ramp.elements
+    while len(elements) > 1:
+        elements.remove(elements[-1])
+    for i, st in enumerate(stops or [{"color": [0.5, 0.5, 0.5, 1.0], "position": 0.0}]):
+        el = elements[0] if i == 0 else elements.new(float(st["position"]))
+        el.position = float(st["position"])
+        el.color = tuple(float(c) for c in st["color"][:4])
+    links.new(fac, ramp.inputs["Fac"])
+    links.new(ramp.outputs["Color"], em.inputs["Color"])
+
+    min_alpha = min([float(st["color"][3]) for st in stops] or [1.0])
+    translucent = alpha < 0.999 or min_alpha < 0.999
+    _link_with_alpha(nodes, links, em, out, alpha_socket=ramp.outputs["Alpha"] if translucent else None, alpha_value=alpha)
+    avg = gradient_average(gradient)
+    mat.diffuse_color = (avg[0], avg[1], avg[2], avg[3] * alpha)
+    set_material_blend(mat, min(alpha, min_alpha))
+    return mat
+
+
+# ---------------------------------------------------------------------------
+# Strokes: a Geometry Nodes outline (non-destructive, follows the Bevel)
+# ---------------------------------------------------------------------------
+
+
+def stroke_node_group() -> "bpy.types.NodeTree":
+    """The shared "Figma Stroke" node group, created on first use.
+
+    Inputs: Geometry, Width (m), Align (INSIDE / CENTER / OUTSIDE), Material,
+    Lift (m).  The tree takes the evaluated geometry (a plane after its Corner
+    Radius bevel, or an ellipse curve), turns the mesh boundary into a curve
+    (Edge Neighbors == 1 -> Mesh to Curve; curve components pass through),
+    resamples it to its evaluated points, gives it Z-up normals so the profile
+    lies in the shape's plane, shifts it inward / outward by half the width
+    for the alignment, sweeps a straight Width-long profile along it with
+    Curve to Mesh (mitre-scaled at corners so sharp rectangles get square
+    outer corners), assigns the stroke material and joins the ribbon with the
+    original geometry so the fill stays.
+    """
+    ng = bpy.data.node_groups.get(STROKE_NODE_GROUP)
+    if ng is not None and ng.bl_idname == "GeometryNodeTree":
+        names = {s.name for s in ng.interface.items_tree if s.in_out == "INPUT"}
+        if {"Width", "Align", "Material", "Lift"} <= names:
+            return ng
+        ng.name += ".old"
+    ng = bpy.data.node_groups.new(STROKE_NODE_GROUP, "GeometryNodeTree")
+    ng.is_modifier = True
+    ng[MANAGED_PROP] = True
+    iface = ng.interface
+    iface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    width = iface.new_socket("Width", in_out="INPUT", socket_type="NodeSocketFloat")
+    width.subtype = "DISTANCE"
+    width.min_value = 0.0
+    width.default_value = 0.001
+    width.description = "Stroke width (Figma stroke weight x import scale)"
+    align = iface.new_socket("Align", in_out="INPUT", socket_type="NodeSocketMenu")
+    align.description = "Where the stroke sits relative to the shape edge (Figma stroke align)"
+    material = iface.new_socket("Material", in_out="INPUT", socket_type="NodeSocketMaterial")
+    lift = iface.new_socket("Lift", in_out="INPUT", socket_type="NodeSocketFloat")
+    lift.subtype = "DISTANCE"
+    lift.default_value = STROKE_LIFT
+    lift.description = "Offset of the stroke above the fill so the two never z-fight"
+    iface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+
+    n, L = ng.nodes, ng.links
+
+    def node(idname, x, y, **props):
+        nd = n.new(idname)
+        nd.location = (x, y)
+        for k, v in props.items():
+            setattr(nd, k, v)
+        return nd
+
+    inp = node("NodeGroupInput", -1500, 0)
+    out = node("NodeGroupOutput", 1300, 0)
+
+    # boundary edges of the mesh -> curve; any curve component passes straight through
+    neighbors = node("GeometryNodeInputMeshEdgeNeighbors", -1300, -200)
+    is_boundary = node("FunctionNodeCompare", -1150, -200, data_type="INT", operation="EQUAL")
+    is_boundary.inputs[3].default_value = 1
+    L.new(neighbors.outputs["Face Count"], is_boundary.inputs[2])
+    to_curve = node("GeometryNodeMeshToCurve", -1000, 0)
+    L.new(inp.outputs["Geometry"], to_curve.inputs["Mesh"])
+    L.new(is_boundary.outputs["Result"], to_curve.inputs["Selection"])
+    parts = node("GeometryNodeSeparateComponents", -1000, -250)
+    L.new(inp.outputs["Geometry"], parts.inputs["Geometry"])
+    outline = node("GeometryNodeJoinGeometry", -820, 0)
+    L.new(to_curve.outputs["Curve"], outline.inputs["Geometry"])
+    L.new(parts.outputs["Curve"], outline.inputs["Geometry"])
+    poly = node("GeometryNodeResampleCurve", -660, 0)
+    poly.inputs["Mode"].default_value = "Evaluated"
+    L.new(outline.outputs["Geometry"], poly.inputs["Curve"])
+    z_up = node("GeometryNodeSetCurveNormal", -500, 0)
+    z_up.inputs["Mode"].default_value = "Z Up"
+    L.new(poly.outputs["Curve"], z_up.inputs["Curve"])
+
+    # mitre factor at each point: 1 / dot(tangent, direction of the incoming segment)
+    index = node("GeometryNodeInputIndex", -660, -400)
+    prev_index = node("GeometryNodeOffsetPointInCurve", -500, -400)
+    prev_index.inputs["Offset"].default_value = -1
+    L.new(index.outputs["Index"], prev_index.inputs["Point Index"])
+    position = node("GeometryNodeInputPosition", -500, -550)
+    prev_pos = node("GeometryNodeSampleIndex", -330, -450, data_type="FLOAT_VECTOR", domain="POINT")
+    L.new(z_up.outputs["Curve"], prev_pos.inputs["Geometry"])
+    L.new(position.outputs["Position"], prev_pos.inputs["Value"])
+    L.new(prev_index.outputs["Point Index"], prev_pos.inputs["Index"])
+    incoming = node("ShaderNodeVectorMath", -160, -450, operation="SUBTRACT")
+    L.new(position.outputs["Position"], incoming.inputs[0])
+    L.new(prev_pos.outputs["Value"], incoming.inputs[1])
+    incoming_dir = node("ShaderNodeVectorMath", 0, -450, operation="NORMALIZE")
+    L.new(incoming.outputs["Vector"], incoming_dir.inputs[0])
+    tangent = node("GeometryNodeInputTangent", 0, -600)
+    cos_half = node("ShaderNodeVectorMath", 160, -450, operation="DOT_PRODUCT")
+    L.new(tangent.outputs["Tangent"], cos_half.inputs[0])
+    L.new(incoming_dir.outputs["Vector"], cos_half.inputs[1])
+    cos_clamped = node("ShaderNodeMath", 320, -450, operation="MAXIMUM")  # cap the mitre at ~5x for spikes
+    cos_clamped.inputs[1].default_value = 0.2
+    L.new(cos_half.outputs["Value"], cos_clamped.inputs[0])
+    mitre = node("ShaderNodeMath", 480, -450, operation="DIVIDE")
+    mitre.inputs[0].default_value = 1.0
+    L.new(cos_clamped.outputs["Value"], mitre.inputs[1])
+
+    # alignment: INSIDE -1 / CENTER 0 / OUTSIDE +1 times half the width, along the outward normal
+    align_switch = node("GeometryNodeMenuSwitch", -1300, 300, data_type="FLOAT")
+    items = align_switch.enum_definition.enum_items
+    while len(items):  # by index: removing reallocates, so earlier item references would dangle
+        items.remove(items[0])
+    for label in ("INSIDE", "CENTER", "OUTSIDE"):
+        items.new(label)
+    L.new(inp.outputs["Align"], align_switch.inputs["Menu"])
+    align_switch.inputs["INSIDE"].default_value = -1.0
+    align_switch.inputs["CENTER"].default_value = 0.0
+    align_switch.inputs["OUTSIDE"].default_value = 1.0
+    half = node("ShaderNodeMath", -1300, 150, operation="MULTIPLY")
+    half.inputs[1].default_value = 0.5
+    L.new(inp.outputs["Width"], half.inputs[0])
+    shift = node("ShaderNodeMath", -1100, 300, operation="MULTIPLY")
+    L.new(align_switch.outputs[0], shift.inputs[0])
+    L.new(half.outputs["Value"], shift.inputs[1])
+    shift_mitred = node("ShaderNodeMath", 640, 300, operation="MULTIPLY")
+    L.new(shift.outputs["Value"], shift_mitred.inputs[0])
+    L.new(mitre.outputs["Value"], shift_mitred.inputs[1])
+    normal = node("GeometryNodeInputNormal", 480, 150)
+    outwardness = node("ShaderNodeVectorMath", 640, 150, operation="DOT_PRODUCT")  # shapes are centred on the origin
+    L.new(normal.outputs["Normal"], outwardness.inputs[0])
+    L.new(position.outputs["Position"], outwardness.inputs[1])
+    outward_sign = node("ShaderNodeMath", 800, 150, operation="SIGN")
+    L.new(outwardness.outputs["Value"], outward_sign.inputs[0])
+    amount = node("ShaderNodeMath", 800, 300, operation="MULTIPLY")
+    L.new(shift_mitred.outputs["Value"], amount.inputs[0])
+    L.new(outward_sign.outputs["Value"], amount.inputs[1])
+    offset = node("ShaderNodeVectorMath", 960, 300, operation="SCALE")
+    L.new(normal.outputs["Normal"], offset.inputs[0])
+    L.new(amount.outputs["Value"], offset.inputs["Scale"])
+    lift_vec = node("ShaderNodeCombineXYZ", 960, 450)
+    L.new(inp.outputs["Lift"], lift_vec.inputs["Z"])
+    offset_lifted = node("ShaderNodeVectorMath", 1120, 300, operation="ADD")
+    L.new(offset.outputs["Vector"], offset_lifted.inputs[0])
+    L.new(lift_vec.outputs["Vector"], offset_lifted.inputs[1])
+
+    capture = node("GeometryNodeCaptureAttribute", 660, 0, domain="POINT")
+    capture.capture_items.new("FLOAT", "Mitre")
+    L.new(z_up.outputs["Curve"], capture.inputs["Geometry"])
+    L.new(mitre.outputs["Value"], capture.inputs["Mitre"])
+    moved = node("GeometryNodeSetPosition", 860, 0)
+    L.new(capture.outputs["Geometry"], moved.inputs["Geometry"])
+    L.new(offset_lifted.outputs["Vector"], moved.inputs["Offset"])
+
+    # ribbon: a straight profile of length Width centred on the curve, mitre-scaled at corners
+    neg_half = node("ShaderNodeMath", -1100, 150, operation="MULTIPLY")
+    neg_half.inputs[1].default_value = -1.0
+    L.new(half.outputs["Value"], neg_half.inputs[0])
+    start = node("ShaderNodeCombineXYZ", -900, 200)
+    end = node("ShaderNodeCombineXYZ", -900, 100)
+    L.new(neg_half.outputs["Value"], start.inputs["X"])
+    L.new(half.outputs["Value"], end.inputs["X"])
+    profile = node("GeometryNodeCurvePrimitiveLine", -700, 150, mode="POINTS")
+    L.new(start.outputs["Vector"], profile.inputs["Start"])
+    L.new(end.outputs["Vector"], profile.inputs["End"])
+    ribbon = node("GeometryNodeCurveToMesh", 1000, 0)
+    L.new(moved.outputs["Geometry"], ribbon.inputs["Curve"])
+    L.new(profile.outputs["Curve"], ribbon.inputs["Profile Curve"])
+    L.new(capture.outputs["Mitre"], ribbon.inputs["Scale"])
+    coloured = node("GeometryNodeSetMaterial", 1140, 0)
+    L.new(ribbon.outputs["Mesh"], coloured.inputs["Geometry"])
+    L.new(inp.outputs["Material"], coloured.inputs["Material"])
+    result = node("GeometryNodeJoinGeometry", 1240, 100)
+    L.new(inp.outputs["Geometry"], result.inputs["Geometry"])
+    L.new(coloured.outputs["Geometry"], result.inputs["Geometry"])
+    L.new(result.outputs["Geometry"], out.inputs["Geometry"])
+    return ng
+
+
+def stroke_socket_ids(ng: "bpy.types.NodeTree") -> Dict[str, str]:
+    return {s.name: s.identifier for s in ng.interface.items_tree if s.in_out == "INPUT"}
+
+
+def stroke_modifier(ob: "bpy.types.Object") -> Optional["bpy.types.Modifier"]:
+    mod = ob.modifiers.get(STROKE_MODIFIER_NAME)
+    if mod is not None and mod.type == "NODES" and mod.node_group is not None and mod.node_group.name.startswith(STROKE_NODE_GROUP):
+        return mod
+    return None
+
+
+def stroke_settings(mod: "bpy.types.Modifier") -> Dict[str, object]:
+    """``{"width", "align", "material", "lift"}`` as set on a Stroke modifier."""
+    ids = stroke_socket_ids(mod.node_group)
+    items = {value: label for label, _, _, _, value in mod.id_properties_ui(ids["Align"]).as_dict()["items"]}
+    return {
+        "width": float(mod[ids["Width"]]),
+        "align": items.get(mod[ids["Align"]], "INSIDE"),
+        "material": mod[ids["Material"]],
+        "lift": float(mod[ids["Lift"]]),
+    }
+
+
+def apply_stroke_modifier(
+    ob: "bpy.types.Object", width: float, align: str, material: "bpy.types.Material", lift: float = STROKE_LIFT
+) -> "bpy.types.Modifier":
+    """Add (right after Corner Radius) or update the object's Stroke modifier."""
+    mod = stroke_modifier(ob)
+    ng = stroke_node_group()
+    if mod is None:
+        mod = ob.modifiers.new(STROKE_MODIFIER_NAME, "NODES")
+        mod.node_group = ng
+        mod.show_expanded = False
+        names = [m.name for m in ob.modifiers]
+        if CORNER_MODIFIER_NAME in names:
+            ob.modifiers.move(len(names) - 1, names.index(CORNER_MODIFIER_NAME) + 1)
+    elif mod.node_group is not ng:
+        mod.node_group = ng
+    ids = stroke_socket_ids(ng)
+    mod[ids["Width"]] = float(width)
+    mod[ids["Material"]] = material
+    mod[ids["Lift"]] = float(lift)
+    items = {label: value for label, _, _, _, value in mod.id_properties_ui(ids["Align"]).as_dict()["items"]}
+    mod[ids["Align"]] = items.get(align, items["INSIDE"])
+    ob.update_tag()
+    return mod
+
+
+def remove_stroke_modifier(ob: "bpy.types.Object") -> None:
+    mod = stroke_modifier(ob)
+    if mod is not None:
+        ob.modifiers.remove(mod)
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +835,7 @@ class SceneBuilder:
         self._svg_px_to_m: Optional[float] = None
         self._text_baseline_ratio: Optional[float] = None
         self._font_cache: Dict[Tuple, Optional["bpy.types.VectorFont"]] = {}
+        self._warned: set = set()
 
         b = scene.bounds or {"x": 0, "y": 0, "w": 0, "h": 0}
         if self.opt.center and scene.bounds:
@@ -587,6 +953,31 @@ class SceneBuilder:
                 removed.objects.link(o)
         self.report.sync["removed" if self.opt.remove_missing else "moved"] += 1
 
+    def _warn_once(self, msg: str) -> None:
+        if msg not in self._warned:
+            self._warned.add(msg)
+            self.report.warnings.append(msg)
+
+    def _fill_material(self, el: Element, coords: str) -> Tuple["bpy.types.Material", bool]:
+        """``(material, is_gradient)`` for an element's first visible fill."""
+        if el.fill_gradient and el.fill_gradient.get("stops"):
+            return self.materials.gradient(el.fill_gradient, el.opacity, coords), True
+        color = el.fill or [0.5, 0.5, 0.5, 1.0]
+        alpha = color[3] * el.opacity if len(color) > 3 else el.opacity
+        return self.materials.flat(color, alpha), False
+
+    def _has_stroke(self, el: Element) -> bool:
+        return bool(el.stroke_rgba) and bool(el.stroke_weight) and float(el.stroke_weight) > 0.0 and el.stroke_rgba[3] * el.opacity > 0.0
+
+    def _apply_stroke(self, ob: "bpy.types.Object", el: Element) -> None:
+        """Add / update / drop the Stroke Geometry Nodes modifier to match the element's stroke."""
+        if not self._has_stroke(el):
+            remove_stroke_modifier(ob)
+            return
+        mat = self.materials.flat(el.stroke_rgba, el.stroke_rgba[3] * el.opacity)
+        lift = min(STROKE_LIFT, self.opt.depth_step / 2.0) if self.opt.depth_step > 0 else STROKE_LIFT
+        apply_stroke_modifier(ob, float(el.stroke_weight) * self.opt.scale, el.stroke_align or "INSIDE", mat, lift)
+
     def _asset_path(self, el: Element) -> Optional[str]:
         if not el.asset:
             return None
@@ -650,13 +1041,14 @@ class SceneBuilder:
             # rect (or an icon / image falling back to its solid fill): always carry
             # the modifier so a radius can be added later without touching the mesh
             ob = self._rect_object(el, el.corner_radii, True, ob)
-        color = el.fill or [0.5, 0.5, 0.5, 1.0]
-        alpha = color[3] * el.opacity if len(color) > 3 else el.opacity
-        self._apply_material(ob.data, self.materials.flat(color, alpha))
-        if el.fill_approx:
+        # planes carry 0..1 UVs; a curve has none, its Generated coordinates span its bound box instead
+        mat, is_gradient = self._fill_material(el, "Generated" if ob.type == "CURVE" else "UV")
+        self._apply_material(ob.data, mat)
+        if el.fill_approx and not is_gradient:
             ob["figma_fill_approx"] = True
         elif "figma_fill_approx" in ob:
             del ob["figma_fill_approx"]
+        self._apply_stroke(ob, el)
         self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
         return ob
 
@@ -685,6 +1077,7 @@ class SceneBuilder:
         except RuntimeError as e:
             self.report.warnings.append("Could not load image %s for %r: %s" % (path, el.name, e))
             self._apply_material(mesh, self.materials.flat(el.fill or [0.5, 0.5, 0.5, 1.0], el.opacity))
+        self._apply_stroke(ob, el)
         self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
         return ob
 
@@ -754,6 +1147,8 @@ class SceneBuilder:
         (and anything the user hung on it) always survives.
         """
         digest = file_hash(path)
+        if self._has_stroke(el):
+            self._warn_once("Strokes on icons are not imported (they survive inside the SVG's own paths only)")
         if empty is None:
             empty = self._new_object(el, el.name, None)
             empty.empty_display_type = "PLAIN_AXES"
@@ -893,9 +1288,16 @@ class SceneBuilder:
                 self.report.missing_fonts.append(fam)
         ob["figma_font"] = info.get("fontFamily") or ""
         ob["figma_font_postscript"] = info.get("fontPostScriptName") or ""
+        # text keeps a solid colour: for a gradient fill that is the stops' average
         color = el.fill or [0.0, 0.0, 0.0, 1.0]
         alpha = color[3] * el.opacity if len(color) > 3 else el.opacity
         self._apply_material(cu, self.materials.flat(color, alpha))
+        if el.fill_approx:
+            ob["figma_fill_approx"] = True
+        elif "figma_fill_approx" in ob:
+            del ob["figma_fill_approx"]
+        if self._has_stroke(el):
+            self._warn_once("Strokes on text are not imported")
 
         # Vertical placement: put Blender's first baseline where Figma's is.
         blender_baseline = self._text_probe() * cu.size  # relative to object origin, y up

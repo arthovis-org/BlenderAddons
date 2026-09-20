@@ -29,6 +29,10 @@ FILLABLE_CONTAINER_TYPES = {"FRAME", "INSTANCE", "COMPONENT", "COMPONENT_SET"}
 TRUE_VECTOR_TYPES = {"VECTOR", "BOOLEAN_OPERATION", "STAR", "LINE", "REGULAR_POLYGON"}
 SHAPE_TYPES = {"RECTANGLE", "ELLIPSE"}
 VECTOR_LIKE_TYPES = TRUE_VECTOR_TYPES | SHAPE_TYPES
+GRADIENT_TYPES = {"GRADIENT_LINEAR", "GRADIENT_RADIAL", "GRADIENT_ANGULAR", "GRADIENT_DIAMOND"}
+STROKE_ALIGNS = {"INSIDE", "CENTER", "OUTSIDE"}
+# Figma's default handles for a gradient without gradientHandlePositions: top -> bottom
+DEFAULT_GRADIENT_HANDLES = [[0.5, 0.0], [0.5, 1.0], [0.0, 0.0]]
 
 Matrix = Tuple[float, float, float, float, float, float]  # a, b, tx, c, d, ty
 IDENTITY: Matrix = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
@@ -61,8 +65,12 @@ class Element:
     rotation: float  # degrees, counter-clockwise (Figma convention)
     matrix: List[float]  # world 2x3 matrix [a, b, tx, c, d, ty]
     opacity: float = 1.0
-    fill: Optional[List[float]] = None  # rgba 0..1
-    fill_approx: bool = False
+    fill: Optional[List[float]] = None  # rgba 0..1 (for a gradient: the stops' average, used as fallback / preview)
+    fill_approx: bool = False  # ``fill`` only approximates the paint (gradient averaged to one colour)
+    fill_gradient: Optional[Dict[str, Any]] = None  # {"type", "stops": [{"color": rgba, "position"}], "handles": [[x, y], ...]}
+    stroke_rgba: Optional[List[float]] = None  # first visible stroke, rgba 0..1
+    stroke_weight: Optional[float] = None  # px
+    stroke_align: Optional[str] = None  # INSIDE | CENTER | OUTSIDE
     corner_radii: Optional[List[float]] = None  # tl, tr, br, bl
     asset: Optional[str] = None  # relative path inside the bundle
     asset_format: Optional[str] = None
@@ -206,15 +214,81 @@ def paint_to_rgba(paint: dict) -> Tuple[Optional[List[float]], bool]:
     return None, False
 
 
-def node_fill(node: dict) -> Tuple[Optional[List[float]], bool]:
-    """First visible non-image fill as rgba plus an ``approx`` flag."""
+def paint_to_gradient(paint: dict) -> Optional[Dict[str, Any]]:
+    """Full description of a gradient paint, or ``None`` for any other paint.
+
+    Stops are sorted by position with the paint's ``opacity`` folded into their
+    alpha; handle positions are Figma's, normalised to the node box (y down).
+    """
+    if paint.get("type") not in GRADIENT_TYPES:
+        return None
+    stops = paint.get("gradientStops") or []
+    if not stops:
+        return None
+    popacity = float(paint.get("opacity", 1.0))
+    out_stops = []
+    for st in stops:
+        c = st.get("color") or {}
+        out_stops.append(
+            {
+                "color": [float(c.get("r", 0.0)), float(c.get("g", 0.0)), float(c.get("b", 0.0)), float(c.get("a", 1.0)) * popacity],
+                "position": max(0.0, min(1.0, float(st.get("position", 0.0)))),
+            }
+        )
+    out_stops.sort(key=lambda st: st["position"])
+    handles = [[float(h.get("x", 0.0)), float(h.get("y", 0.0))] for h in paint.get("gradientHandlePositions") or []]
+    if len(handles) < 2:
+        handles = [list(h) for h in DEFAULT_GRADIENT_HANDLES]
+    return {"type": paint["type"], "stops": out_stops, "handles": handles}
+
+
+def _first_colour_paint(node: dict) -> Optional[dict]:
     for paint in visible_fills(node):
         if paint.get("type") == "IMAGE":
             continue
-        rgba, approx = paint_to_rgba(paint)
+        if paint_to_rgba(paint)[0] is not None:
+            return paint
+    return None
+
+
+def node_fill(node: dict) -> Tuple[Optional[List[float]], bool]:
+    """First visible non-image fill as rgba plus an ``approx`` flag."""
+    paint = _first_colour_paint(node)
+    if paint is None:
+        return None, False
+    return paint_to_rgba(paint)
+
+
+def node_gradient(node: dict) -> Optional[Dict[str, Any]]:
+    """The gradient behind :func:`node_fill`'s colour, when that fill is a gradient."""
+    paint = _first_colour_paint(node)
+    return paint_to_gradient(paint) if paint is not None else None
+
+
+def node_stroke(node: dict) -> Optional[Tuple[List[float], float, str]]:
+    """``(rgba, weight_px, align)`` of the first visible stroke with a weight > 0, else ``None``.
+
+    Gradient strokes are averaged to one colour; image strokes are ignored.
+    ``individualStrokeWeights`` (per side) is reduced to its largest side.
+    """
+    strokes = [st for st in node.get("strokes") or [] if st.get("visible", True) is not False]
+    if not strokes:
+        return None
+    rgba = None
+    for paint in strokes:
+        rgba, _ = paint_to_rgba(paint)
         if rgba is not None:
-            return rgba, approx
-    return None, False
+            break
+    if rgba is None or rgba[3] <= 0.0:
+        return None
+    weight = node.get("strokeWeight")
+    if weight is None and node.get("individualStrokeWeights"):
+        weight = max(float(v) for v in node["individualStrokeWeights"].values())
+    weight = float(weight or 0.0)
+    if weight <= 0.0:
+        return None
+    align = node.get("strokeAlign") or "INSIDE"
+    return rgba, weight, align if align in STROKE_ALIGNS else "INSIDE"
 
 
 def corner_radii(node: dict) -> Optional[List[float]]:
@@ -350,6 +424,22 @@ class SceneBuilder:
         )
         return el
 
+    @staticmethod
+    def _paint(el: Element, node: dict, shape: bool) -> None:
+        """Fill colour, gradient and stroke of ``node`` onto ``el``.
+
+        ``shape`` elements (rectangles, ellipses, frame backgrounds) that have a
+        stroke but no fill get a fully transparent fill so the outline alone is
+        imported.
+        """
+        el.fill, el.fill_approx = node_fill(node)
+        el.fill_gradient = node_gradient(node)
+        stroke = node_stroke(node)
+        if stroke is not None:
+            el.stroke_rgba, el.stroke_weight, el.stroke_align = list(stroke[0]), stroke[1], stroke[2]
+            if shape and el.fill is None:
+                el.fill = [0.0, 0.0, 0.0, 0.0]
+
     def walk(self, node: dict, parent_id: Optional[str], parent_world: Matrix) -> None:
         if not is_visible(node):
             return
@@ -359,7 +449,7 @@ class SceneBuilder:
 
         if t == "TEXT":
             el = self._make(node, "text", parent_id, world)
-            el.fill, el.fill_approx = node_fill(node)
+            self._paint(el, node, shape=False)
             el.text = text_info(node)
             if el.text.get("hasStyleOverrides"):
                 self.warnings.append("Text %r has per-character style overrides (not supported)" % el.name)
@@ -368,6 +458,9 @@ class SceneBuilder:
 
         if has_image_fill(node):
             el = self._make(node, "image", parent_id, world)
+            stroke = node_stroke(node)
+            if stroke is not None:
+                el.stroke_rgba, el.stroke_weight, el.stroke_align = list(stroke[0]), stroke[1], stroke[2]
             el.corner_radii = corner_radii(node)
             el.asset_format = opts.image_format
             el.asset = "assets/image_%s.%s" % (sanitize_id(node["id"]), opts.image_format)
@@ -376,7 +469,7 @@ class SceneBuilder:
 
         if is_icon(node, opts.icon_max_size):
             el = self._make(node, "icon", parent_id, world)
-            el.fill, el.fill_approx = node_fill(node)
+            self._paint(el, node, shape=False)
             el.asset_format = opts.icon_format
             el.asset = "assets/icon_%s.%s" % (sanitize_id(node["id"]), opts.icon_format)
             self.elements.append(el)
@@ -384,7 +477,7 @@ class SceneBuilder:
 
         if t == "RECTANGLE":
             el = self._make(node, "rect", parent_id, world)
-            el.fill, el.fill_approx = node_fill(node)
+            self._paint(el, node, shape=True)
             el.corner_radii = corner_radii(node)
             if el.fill is not None:
                 self.elements.append(el)
@@ -392,7 +485,7 @@ class SceneBuilder:
 
         if t == "ELLIPSE":
             el = self._make(node, "ellipse", parent_id, world)
-            el.fill, el.fill_approx = node_fill(node)
+            self._paint(el, node, shape=True)
             if el.fill is not None:
                 self.elements.append(el)
             return
@@ -401,14 +494,15 @@ class SceneBuilder:
             group = self._make(node, "group", parent_id, world)
             self.elements.append(group)
             if t in FILLABLE_CONTAINER_TYPES:
-                fill, approx = node_fill(node)
-                if fill is not None:
-                    bg = self._make(node, "rect", group.id, world)
+                bg = self._make(node, "rect", group.id, world)
+                self._paint(bg, node, shape=True)
+                if bg.fill is not None:  # a fill and/or a stroke -> background plane
                     bg.id = group.id + ":bg"
                     bg.name = group.name + " (background)"
-                    bg.fill, bg.fill_approx = fill, approx
                     bg.corner_radii = corner_radii(node)
                     self.elements.append(bg)
+                else:
+                    self._ids_seen[node["id"]] -= 1  # no background element: give its id back
             for child in node.get("children") or []:
                 self.walk(child, group.id, world)
             return

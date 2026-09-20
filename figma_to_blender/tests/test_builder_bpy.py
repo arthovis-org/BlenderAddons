@@ -99,14 +99,14 @@ class BuilderTests(unittest.TestCase):
         scene, report, _ = self._build("SVG")
         self.assertIn("Page 1", bpy.data.collections)
         coll = bpy.data.collections["Page 1"]
-        self.assertEqual(report.counts, {"group": 5, "rect": 4, "text": 5, "ellipse": 1, "image": 1, "icon": 5})
+        self.assertEqual(report.counts, {"group": 5, "rect": 7, "text": 5, "ellipse": 2, "image": 1, "icon": 5})
         fonts = [o for o in report.objects if o.type == "FONT"]
         meshes = [o for o in report.objects if o.type == "MESH"]
         curves = [o for o in report.objects if o.type == "CURVE"]
         empties = [o for o in report.objects if o.type == "EMPTY"]
         self.assertEqual(len(fonts), 5)
-        self.assertEqual(len(meshes), 5)  # 4 rects + image plane (ellipse is a curve)
-        self.assertEqual(len(curves), 5 * 2 + 1)  # fixture SVG has 2 shapes, 5 icons, + ellipse curve
+        self.assertEqual(len(meshes), 8)  # 7 rects + image plane (ellipses are curves)
+        self.assertEqual(len(curves), 5 * 2 + 2)  # fixture SVG has 2 shapes, 5 icons, + 2 ellipse curves
         self.assertEqual(len(empties), 5 + 5)  # groups + icon roots
         for ob in report.objects:
             self.assertIn(coll, ob.users_collection)
@@ -138,7 +138,7 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(report.counts["icon"], 5)
         # no icon curves in PLANE mode (the ellipse curve is unrelated to icon mode)
         self.assertFalse([o for o in report.objects if o.type == "CURVE" and o.get("figma_kind") != "ellipse"])
-        self.assertEqual(len([o for o in report.objects if o.type == "CURVE"]), 1)
+        self.assertEqual(len([o for o in report.objects if o.type == "CURVE"]), 2)
         arrow = self._by_name(report, "Arrow")
         self.assertEqual(arrow.type, "MESH")
         lo, hi = obj_bbox([arrow])
@@ -249,8 +249,9 @@ class BuilderTests(unittest.TestCase):
         self.assertIs(label.data.materials[0], bg.data.materials[0])
         button = self._by_name(report, "Button (background)")
         self.assertIsNot(button.data.materials[0], amat)  # same colour, different alpha
-        header = self._by_name(report, "Header")
-        self.assertTrue(header["figma_fill_approx"])
+        for m in bpy.data.materials:
+            if m.name.startswith("Figma"):
+                self.assertTrue(m["figma_managed"])
         # the ellipse is a filled curve carrying the same flat material
         ellipse = self._by_name(report, "Avatar bg")
         self.assertEqual(ellipse.type, "CURVE")
@@ -374,6 +375,153 @@ class BuilderTests(unittest.TestCase):
         # centred on the node: Avatar group at Card(100,200)+(24,260) = (124,460), 64x64 -> centre (156, 492)
         self.assertAlmostEqual(ellipse.location.x, 0.156, places=6)
         self.assertAlmostEqual(ellipse.location.z, -0.492, places=6)
+
+    # -- gradients (shader nodes) and strokes (Geometry Nodes) -------------------
+
+    def _eval_extent(self, ob):
+        """(dx, dy) of the evaluated geometry in object space (modifiers applied)."""
+        ev = self._evaluated(ob)
+        me = ev.to_mesh()
+        xs = [v.co.x for v in me.vertices]
+        ys = [v.co.y for v in me.vertices]
+        mats = [m.name for m in me.materials if m is not None]
+        n_faces = len(me.polygons)
+        ev.to_mesh_clear()
+        return round(max(xs) - min(xs), 6), round(max(ys) - min(ys), 6), mats, n_faces
+
+    def test_gradient_fill_is_shader_nodes(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG")
+        header = self._by_name(report, "Header")
+        self.assertNotIn("figma_fill_approx", header)  # a real gradient, not an approximation any more
+        mat = header.data.materials[0]
+        self.assertTrue(mat["figma_managed"])
+        nodes = mat.node_tree.nodes
+        grads = [n for n in nodes if n.type == "TEX_GRADIENT"]
+        self.assertEqual(len(grads), 1)
+        self.assertEqual(grads[0].gradient_type, "LINEAR")
+        ramps = [n for n in nodes if n.type == "VALTORGB"]
+        self.assertEqual(len(ramps), 1)
+        stops = ramps[0].color_ramp.elements
+        self.assertEqual(len(stops), 2)
+        self.assertAlmostEqual(stops[0].position, 0.0)
+        self.assertAlmostEqual(stops[1].position, 1.0)
+        self.assertEqual(tuple(round(c, 3) for c in stops[0].color), (0.2, 0.4, 1.0, 1.0))
+        self.assertEqual(tuple(round(c, 3) for c in stops[1].color), (0.6, 0.2, 0.8, 1.0))
+        self.assertEqual(len([n for n in nodes if n.type == "EMISSION"]), 1)
+        mapping = [n for n in nodes if n.type == "MAPPING"][0]
+        self.assertEqual(mapping.vector_type, "TEXTURE")
+        # handles (0, .5) -> (1, .5): origin at UV (0, .5), no rotation, unit length
+        self.assertEqual(tuple(round(v, 4) for v in mapping.inputs["Location"].default_value), (0.0, 0.5, 0.0))
+        self.assertEqual(tuple(round(v, 4) for v in mapping.inputs["Rotation"].default_value), (0.0, 0.0, 0.0))
+        self.assertEqual(tuple(round(v, 4) for v in mapping.inputs["Scale"].default_value), (1.0, 1.0, 1.0))
+        link = [l for l in mat.node_tree.links if l.to_node == mapping][0]
+        self.assertEqual(link.from_node.type, "TEX_COORD")
+        self.assertEqual(link.from_socket.name, "UV")  # planes carry 0..1 UVs across the node box
+        # radial gradient: SPHERICAL (1 at the centre) inverted so Figma's position 0 is the centre
+        glow = self._by_name(report, "Glow")
+        gm = glow.data.materials[0]
+        self.assertIsNot(gm, mat)
+        self.assertEqual([n for n in gm.node_tree.nodes if n.type == "TEX_GRADIENT"][0].gradient_type, "SPHERICAL")
+        self.assertTrue([n for n in gm.node_tree.nodes if n.type == "MATH" and n.operation == "SUBTRACT"])
+        gmap = [n for n in gm.node_tree.nodes if n.type == "MAPPING"][0]
+        self.assertEqual(tuple(round(v, 4) for v in gmap.inputs["Location"].default_value), (0.5, 0.5, 0.0))
+        self.assertEqual(tuple(round(v, 4) for v in gmap.inputs["Scale"].default_value), (0.5, 0.5, 1.0))
+        gstops = [n for n in gm.node_tree.nodes if n.type == "VALTORGB"][0].color_ramp.elements
+        self.assertEqual(tuple(round(c, 3) for c in gstops[0].color), (1.0, 0.85, 0.2, 1.0))
+        self.assertEqual(tuple(round(c, 3) for c in gstops[-1].color), (0.9, 0.2, 0.3, 1.0))
+        # mapping maths: a top -> bottom Figma gradient starts at UV (.5, 1) and points down
+        loc, rot, scl = builder.gradient_mapping({"type": "GRADIENT_LINEAR", "handles": [[0.5, 0.0], [0.5, 1.0]]})
+        self.assertEqual(tuple(round(v, 6) for v in loc), (0.5, 1.0, 0.0))
+        self.assertAlmostEqual(rot, -math.pi / 2, places=6)
+        self.assertEqual(tuple(round(v, 6) for v in scl), (1.0, 1.0, 1.0))
+        # angular / diamond build too (angular through RADIAL + fract, diamond as |x| + |y|); alpha stops blend
+        for gtype, expect in (("GRADIENT_ANGULAR", "RADIAL"), ("GRADIENT_DIAMOND", None)):
+            g = {
+                "type": gtype,
+                "stops": [{"color": [1, 0, 0, 1], "position": 0.0}, {"color": [0, 0, 1, 0.5], "position": 1.0}],
+                "handles": [[0.5, 0.5], [1.0, 0.5], [0.5, 1.0]],
+            }
+            m = builder.make_gradient_material("t " + gtype, g, 1.0, "Generated")
+            kinds = [n.type for n in m.node_tree.nodes]
+            self.assertIn("VALTORGB", kinds)
+            self.assertIn("MIX_SHADER", kinds)  # a translucent stop -> transparent mix
+            self.assertEqual(m.surface_render_method, "BLENDED")
+            if expect:
+                self.assertEqual([n for n in m.node_tree.nodes if n.type == "TEX_GRADIENT"][0].gradient_type, expect)
+            else:
+                self.assertNotIn("TEX_GRADIENT", kinds)
+                self.assertIn("SEPXYZ", kinds)
+            self.assertEqual([l.from_socket.name for l in m.node_tree.links if l.from_node.type == "TEX_COORD"], ["Generated"])
+        # more stops than a Color Ramp holds are clamped to 32
+        many = {"type": "GRADIENT_LINEAR", "stops": [{"color": [i / 40, 0, 0, 1], "position": i / 39} for i in range(40)], "handles": [[0, 0], [1, 0]]}
+        m = builder.make_gradient_material("many", many)
+        self.assertEqual(len([n for n in m.node_tree.nodes if n.type == "VALTORGB"][0].color_ramp.elements), 32)
+        # the same gradient is one material (cached by content), text with a gradient keeps a flat colour
+        cache = builder.MaterialCache()
+        self.assertIs(cache.gradient(many, 1.0), cache.gradient(dict(many), 1.0))
+
+    def test_stroke_is_geometry_nodes_modifier(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG")
+        card = self._by_name(report, "Outlined card")
+        self.assertEqual([m.name for m in card.modifiers], ["Corner Radius", "Stroke"])
+        mod = card.modifiers["Stroke"]
+        self.assertEqual(mod.type, "NODES")
+        self.assertEqual(mod.node_group.name, "Figma Stroke")
+        st = builder.stroke_settings(mod)
+        self.assertAlmostEqual(st["width"], 4 * 0.001, places=9)  # strokeWeight x scale
+        self.assertEqual(st["align"], "INSIDE")
+        self.assertEqual(tuple(round(c, 3) for c in st["material"].diffuse_color), (0.2, 0.4, 1.0, 1.0))
+        self.assertAlmostEqual(st["lift"], 0.0001, places=9)
+        # one shared node group for every stroked object in the file
+        self.assertEqual(len([g for g in bpy.data.node_groups if g.name.startswith("Figma Stroke")]), 1)
+        # the mesh itself is still the 4-vertex plane; the evaluated result carries the ribbon
+        self.assertEqual(len(card.data.vertices), 4)
+        dx, dy, mats, n_faces = self._eval_extent(card)
+        self.assertEqual((dx, dy), (0.2, 0.06))  # INSIDE: nothing sticks out of the 200 x 60 px box
+        self.assertGreater(n_faces, 1)
+        self.assertIn(card.data.materials[0].name, mats)
+        self.assertIn(st["material"].name, mats)
+        # ellipse (curve object): CENTER, 80 px + 6 px -> 86 px; the fill face is still there
+        ring = self._by_name(report, "Ring")
+        self.assertEqual(ring.type, "CURVE")
+        rmod = builder.stroke_modifier(ring)
+        self.assertIsNotNone(rmod)
+        self.assertEqual(builder.stroke_settings(rmod)["align"], "CENTER")
+        self.assertAlmostEqual(builder.stroke_settings(rmod)["width"], 0.006, places=9)
+        dx, dy, mats, n_faces = self._eval_extent(ring)
+        self.assertAlmostEqual(dx, 0.086, places=4)
+        self.assertAlmostEqual(dy, 0.086, places=4)
+        self.assertIn(ring.data.materials[0].name, mats)
+        self.assertGreater(n_faces, 4 * 24)  # more than the ribbon quads alone: the filled disc is still there
+        # OUTSIDE: 100 px + 2 x 2 px
+        glow = self._by_name(report, "Glow")
+        self.assertEqual(builder.stroke_settings(builder.stroke_modifier(glow))["align"], "OUTSIDE")
+        dx, dy, _, _ = self._eval_extent(glow)
+        self.assertEqual((dx, dy), (0.104, 0.104))
+        # stroke-only rectangle: a transparent fill plus the outline
+        outline = self._by_name(report, "Outline only")
+        self.assertAlmostEqual(outline.data.materials[0].diffuse_color[3], 0.0, places=6)
+        self.assertEqual(outline.data.materials[0].surface_render_method, "BLENDED")
+        self.assertIsNotNone(builder.stroke_modifier(outline))
+        # elements without a stroke get no modifier; the stroke material is a shared flat material
+        self.assertIsNone(builder.stroke_modifier(self._by_name(report, "Header")))
+        self.assertTrue(st["material"].name.startswith("Figma 3366FF"))
+        # re-import: changed weight / align update the modifier in place, a dropped stroke removes it
+        el = next(e for e in scene.elements if e.id == "2:1")
+        el.stroke_weight, el.stroke_align = 8.0, "OUTSIDE"
+        next(e for e in scene.elements if e.id == "2:2").stroke_rgba = None
+        report2 = self._rebuild(scene)
+        self.assertIs(self._by_name(report2, "Outlined card"), card)
+        self.assertEqual(card.modifiers["Stroke"], mod)  # same modifier (RNA wrappers compare by pointer)
+        self.assertAlmostEqual(builder.stroke_settings(mod)["width"], 0.008, places=9)
+        self.assertEqual(builder.stroke_settings(mod)["align"], "OUTSIDE")
+        self.assertEqual(self._eval_extent(card)[:2], (0.216, 0.076))
+        self.assertIsNone(builder.stroke_modifier(ring))
+        self.assertEqual(len([g for g in bpy.data.node_groups if g.name.startswith("Figma Stroke")]), 1)
 
     def test_frame_root_collection_named_after_frame_at_origin(self):
         from figma_to_blender import builder

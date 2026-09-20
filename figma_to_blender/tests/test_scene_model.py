@@ -95,7 +95,7 @@ class BuildSceneTests(unittest.TestCase):
         counts = {}
         for e in self.scene.elements:
             counts[e.kind] = counts.get(e.kind, 0) + 1
-        self.assertEqual(counts, {"group": 5, "rect": 4, "text": 5, "ellipse": 1, "image": 1, "icon": 5})
+        self.assertEqual(counts, {"group": 5, "rect": 7, "text": 5, "ellipse": 2, "image": 1, "icon": 5})
         self.assertEqual(self.scene.page_name, "Page 1")
         self.assertEqual(self.scene.file_key, "KEY")
 
@@ -157,6 +157,92 @@ class BuildSceneTests(unittest.TestCase):
         self.assertAlmostEqual(header.fill[1], 0.3)
         self.assertAlmostEqual(header.fill[2], 0.9)
         self.assertEqual(header.corner_radii, [16.0, 16.0, 0.0, 0.0])
+
+    def test_gradient_exported_with_stops_and_handles(self):
+        header = by_id(self.scene, "1:3")
+        g = header.fill_gradient
+        self.assertEqual(g["type"], "GRADIENT_LINEAR")
+        self.assertEqual([s["position"] for s in g["stops"]], [0.0, 1.0])
+        self.assertEqual(g["stops"][0]["color"], [0.2, 0.4, 1.0, 1.0])
+        self.assertEqual(g["stops"][1]["color"], [0.6, 0.2, 0.8, 1.0])
+        self.assertEqual(g["handles"], [[0.0, 0.5], [1.0, 0.5], [0.0, 1.0]])
+        glow = by_id(self.scene, "2:3")
+        self.assertEqual(glow.fill_gradient["type"], "GRADIENT_RADIAL")
+        self.assertEqual(glow.fill_gradient["handles"][0], [0.5, 0.5])
+        self.assertTrue(glow.fill_approx)  # ``fill`` is still the averaged fallback colour
+        self.assertAlmostEqual(glow.fill[0], 0.95)
+        self.assertIsNone(by_id(self.scene, "1:7").fill_gradient)  # solid fill
+        self.assertIsNone(by_id(self.scene, "1:2:bg").fill_gradient)
+        # paint opacity folds into the stop alphas, stops are sorted, missing handles get Figma's default
+        g = scene_model.paint_to_gradient(
+            {
+                "type": "GRADIENT_ANGULAR",
+                "opacity": 0.5,
+                "gradientStops": [
+                    {"color": {"r": 0, "g": 0, "b": 0, "a": 1}, "position": 1},
+                    {"color": {"r": 1, "g": 1, "b": 1, "a": 0.5}, "position": 0},
+                ],
+            }
+        )
+        self.assertEqual([s["position"] for s in g["stops"]], [0.0, 1.0])
+        self.assertEqual(g["stops"][0]["color"], [1.0, 1.0, 1.0, 0.25])
+        self.assertEqual(g["stops"][1]["color"][3], 0.5)
+        self.assertEqual(g["handles"], scene_model.DEFAULT_GRADIENT_HANDLES)
+        self.assertIsNone(scene_model.paint_to_gradient({"type": "SOLID", "color": {"r": 1}}))
+        self.assertIsNone(scene_model.paint_to_gradient({"type": "GRADIENT_LINEAR", "gradientStops": []}))
+        # gradients round-trip through scene.json
+        with tempfile.TemporaryDirectory() as tmp:
+            write_scene(self.scene, tmp)
+            loaded = load_scene(tmp)
+        self.assertEqual(by_id(loaded, "1:3").fill_gradient, header.fill_gradient)
+
+    def test_strokes_exported(self):
+        card = by_id(self.scene, "2:1")
+        self.assertEqual(card.kind, "rect")
+        self.assertEqual(card.stroke_rgba, [0.2, 0.4, 1.0, 1.0])
+        self.assertEqual(card.stroke_weight, 4.0)
+        self.assertEqual(card.stroke_align, "INSIDE")
+        self.assertAlmostEqual(card.fill[0], 0.95)
+        self.assertEqual(card.corner_radii, [12.0] * 4)
+        ring = by_id(self.scene, "2:2")
+        self.assertEqual((ring.kind, ring.stroke_weight, ring.stroke_align), ("ellipse", 6.0, "CENTER"))
+        self.assertEqual((by_id(self.scene, "2:3").stroke_weight, by_id(self.scene, "2:3").stroke_align), (2.0, "OUTSIDE"))
+        # a stroke without a fill still imports: transparent fill + outline
+        outline = by_id(self.scene, "2:4")
+        self.assertEqual(outline.fill, [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(outline.stroke_rgba, [0.0, 0.0, 0.0, 1.0])
+        # nodes without strokes export nothing (keys absent from scene.json)
+        header = by_id(self.scene, "1:3")
+        self.assertIsNone(header.stroke_rgba)
+        self.assertNotIn("stroke_weight", header.to_dict())
+        # a frame with only a stroke gets a background plane; a bare frame gets none and keeps ids clean
+        frame = {
+            "id": "3:1", "name": "F", "type": "FRAME", "size": {"x": 10, "y": 10}, "relativeTransform": [[1, 0, 0], [0, 1, 0]],
+            "fills": [], "strokes": [{"type": "SOLID", "color": {"r": 1, "g": 0, "b": 0, "a": 1}}], "strokeWeight": 2, "strokeAlign": "OUTSIDE",
+            "children": [],
+        }
+        scene = build_scene({"id": "0:1", "name": "P", "type": "CANVAS", "children": [frame]})
+        self.assertEqual([e.id for e in scene.elements], ["3:1", "3:1:bg"])
+        self.assertEqual(scene.elements[1].fill, [0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(scene.elements[1].stroke_align, "OUTSIDE")
+        bare = dict(frame, strokes=[], children=[dict(frame, id="3:2", strokes=[])])
+        scene = build_scene({"id": "0:1", "name": "P", "type": "CANVAS", "children": [bare]})
+        self.assertEqual([e.id for e in scene.elements], ["3:1", "3:2"])
+        # node_stroke edge cases
+        solid = {"type": "SOLID", "color": {"r": 0, "g": 1, "b": 0, "a": 1}}
+        self.assertIsNone(scene_model.node_stroke({"strokes": [dict(solid, visible=False)], "strokeWeight": 2}))
+        self.assertIsNone(scene_model.node_stroke({"strokes": [solid], "strokeWeight": 0}))
+        self.assertIsNone(scene_model.node_stroke({"strokes": [], "strokeWeight": 3}))
+        self.assertEqual(
+            scene_model.node_stroke({"strokes": [solid], "individualStrokeWeights": {"top": 1, "bottom": 3, "left": 0, "right": 0}}),
+            ([0.0, 1.0, 0.0, 1.0], 3.0, "INSIDE"),
+        )
+        self.assertEqual(scene_model.node_stroke({"strokes": [solid], "strokeWeight": 1, "strokeAlign": "WEIRD"})[2], "INSIDE")
+        grad_stroke = {"type": "GRADIENT_LINEAR", "gradientStops": [{"color": {"r": 1, "g": 0, "b": 0, "a": 1}, "position": 0}, {"color": {"r": 0, "g": 0, "b": 1, "a": 1}, "position": 1}]}
+        self.assertEqual(scene_model.node_stroke({"strokes": [grad_stroke], "strokeWeight": 1})[0], [0.5, 0.0, 0.5, 1.0])
+        # text strokes are exported too (the builder warns and skips them)
+        text = dict(by_id(self.scene, "1:4").to_dict())
+        self.assertNotIn("stroke_rgba", text)
 
     def test_ellipse_opacity(self):
         e = by_id(self.scene, "1:7")
