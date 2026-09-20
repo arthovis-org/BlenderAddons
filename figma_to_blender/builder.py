@@ -61,6 +61,21 @@ GRADIENT_MAX_STOPS = 32  # Blender's Color Ramp limit
 COMPONENT_PROP = "figma_component"  # custom property on a component's own collection (COLLECTION_INSTANCE mode)
 COMPONENT_SUFFIX = " (component)"
 INSTANCE_MODES = ("LINKED_DATA", "COLLECTION_INSTANCE")
+DEPTH_MODIFIER_NAME = "Depth"  # Solidify on planes (thickness toward the back, front face stays put)
+SCREEN_MODIFIER_NAME = "Screen Curve"  # Simple Deform BEND around the shared "<root> Curve Origin" Empty
+CURVE_ORIGIN_ID = "__curve_origin__"  # ``figma_elem_id`` of that Empty
+DEPTH_PROP = "figma_depth"  # thickness (m) the importer applied; sync only overwrites while the value is unchanged
+TEXT_BEVEL_PROP = "figma_text_bevel"
+SCREEN_ANGLE_PROP = "figma_curve_angle"
+DEPTH_KINDS = ("frame", "button", "shape", "text", "icon", "image")
+BUTTON_MAX_SIZE = 400.0  # px: a container background with a TEXT child up to this size counts as a button
+# 3D presets, in Figma px (converted with ``BuildOptions.scale``): total thickness per element kind and the
+# text bevel.  FLAT is the plain 2D import.
+DEPTH_PRESETS: Dict[str, Dict[str, float]] = {
+    "FLAT": {"frame": 0.0, "button": 0.0, "shape": 0.0, "text": 0.0, "icon": 0.0, "image": 0.0, "text_bevel": 0.0},
+    "SUBTLE": {"frame": 2.0, "button": 3.0, "shape": 1.0, "text": 0.5, "icon": 0.5, "image": 1.0, "text_bevel": 0.0},
+    "CARD": {"frame": 8.0, "button": 6.0, "shape": 3.0, "text": 1.5, "icon": 1.5, "image": 3.0, "text_bevel": 0.25},
+}
 
 
 @dataclass
@@ -81,6 +96,23 @@ class BuildOptions:
     # component's objects go into their own collection and each instance is a single Empty
     # instancing it (only for components that are part of the export; others fall back).
     instance_mode: str = "LINKED_DATA"
+    # 3D: a DEPTH_PRESETS key (FLAT / SUBTLE / CARD; anything else starts from FLAT) plus optional
+    # per-kind overrides in Figma px ({"frame", "button", "shape", "text", "icon", "image", "text_bevel"}).
+    depth_preset: str = "FLAT"
+    depths: Optional[Dict[str, float]] = None
+    # Curved screen: bend every mesh / curve / text object around a shared origin Empty at the
+    # frame centre so the UI approximates a cylinder of ``curve_radius`` metres facing the viewer.
+    curve_screen: bool = False
+    curve_radius: float = 1.0
+
+
+def resolve_depths(preset: str, overrides: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """Depth per kind (px) for a preset with per-kind overrides applied."""
+    depths = dict(DEPTH_PRESETS.get(preset, DEPTH_PRESETS["FLAT"]))
+    for k, v in (overrides or {}).items():
+        if k in depths and v is not None:
+            depths[k] = max(0.0, float(v))
+    return depths
 
 
 @dataclass
@@ -855,6 +887,16 @@ class SceneBuilder:
         self._comp_colls: Dict[str, "bpy.types.Collection"] = {}  # COLLECTION_INSTANCE mode: component id -> collection
         self._collapsed: set = set()  # ids of instance descendants replaced by a collection instance
         self._target: Optional["bpy.types.Collection"] = None  # collection receiving the element being built
+        # 3D presets / curved screen
+        self.depths = resolve_depths(self.opt.depth_preset, self.opt.depths)
+        self._by_id: Dict[str, Element] = {e.id: e for e in scene.elements}
+        self._text_parents = {e.parent for e in scene.elements if e.kind == "text" and e.parent}
+        self._first_child: Dict[str, str] = {}
+        for e in scene.elements:
+            if e.parent and e.kind != "group" and not e.id.endswith(":bg"):
+                self._first_child.setdefault(e.parent, e.id)
+        self._curve_origin: Optional["bpy.types.Object"] = None
+        self._stale_origin: Optional["bpy.types.Object"] = None
         self._svg_px_to_m: Optional[float] = None
         self._text_baseline_ratio: Optional[float] = None
         self._font_cache: Dict[Tuple, Optional["bpy.types.VectorFont"]] = {}
@@ -1123,6 +1165,181 @@ class SceneBuilder:
             return None
         return p
 
+    # -- 3D presets: depth via modifiers / curve properties, curved screen ------------
+
+    def depth_kind(self, el: Element) -> str:
+        """Which ``DEPTH_KINDS`` entry applies to an element.
+
+        *button*: the background plane of a container that has a direct TEXT
+        child and is smaller than ``BUTTON_MAX_SIZE`` px on its longest side, or
+        a plain rectangle that is the first drawn child of such a container
+        and fills it.  Other container backgrounds are *frame*; other rects and
+        ellipses are *shape*.
+        """
+        if el.kind in ("text", "icon", "image"):
+            return el.kind
+        if el.kind == "ellipse":
+            return "shape"
+        if el.id.endswith(":bg"):
+            if el.parent in self._text_parents and max(el.w, el.h) < BUTTON_MAX_SIZE:
+                return "button"
+            return "frame"
+        parent = self._by_id.get(el.parent) if el.parent else None
+        if (
+            parent is not None
+            and el.parent in self._text_parents
+            and self._first_child.get(el.parent) == el.id
+            and abs(parent.w - el.w) <= 1.0
+            and abs(parent.h - el.h) <= 1.0
+            and max(el.w, el.h) < BUTTON_MAX_SIZE
+        ):
+            return "button"
+        return "shape"
+
+    def depth_for(self, el: Element) -> float:
+        """Total thickness in metres for ``el`` under the current preset."""
+        return self.depths.get(self.depth_kind(el), 0.0) * self.opt.scale
+
+    def _apply_solidify(self, ob: "bpy.types.Object", thickness: float) -> None:
+        """Add / update / remove the *Depth* Solidify modifier unless the user changed its thickness.
+
+        ``offset = -1`` grows the shell toward the back so the front face stays
+        where Figma put it; even thickness keeps the rim uniform around the
+        bevelled corners.  The modifier sits after *Stroke* (the outline needs
+        the flat boundary) and before *Screen Curve*.
+        """
+        mod = ob.modifiers.get(DEPTH_MODIFIER_NAME)
+        if mod is not None and mod.type != "SOLIDIFY":
+            mod = None
+        applied = ob.get(DEPTH_PROP)
+        if mod is not None and (applied is None or not math.isclose(mod.thickness, float(applied), abs_tol=1e-9)):
+            return  # the user's own modifier, or a thickness they changed: leave it alone
+        if thickness <= 0.0:
+            if mod is not None:
+                ob.modifiers.remove(mod)
+            if DEPTH_PROP in ob:
+                del ob[DEPTH_PROP]
+            return
+        if mod is None:
+            mod = ob.modifiers.new(DEPTH_MODIFIER_NAME, "SOLIDIFY")
+            mod.offset = -1.0
+            mod.use_even_offset = True
+            mod.use_rim = True
+            mod.show_expanded = False
+            names = [m.name for m in ob.modifiers]
+            if SCREEN_MODIFIER_NAME in names:
+                ob.modifiers.move(len(names) - 1, names.index(SCREEN_MODIFIER_NAME))
+        mod.thickness = thickness
+        ob[DEPTH_PROP] = thickness
+
+    def _apply_extrude(self, cu, thickness: float, bevel: Optional[float] = None) -> None:
+        """Set ``curve.extrude`` (half the thickness per side) and, for text, ``bevel_depth`` on a curve datablock.
+
+        Values live on the data (shared between linked instances) and are only
+        overwritten while they still equal what the importer applied last time.
+        """
+        if self._written(cu):
+            return
+        applied = float(cu.get(DEPTH_PROP, 0.0))
+        if math.isclose(cu.extrude * 2.0, applied, abs_tol=1e-9):
+            cu.extrude = thickness / 2.0
+            if thickness > 0.0:
+                cu[DEPTH_PROP] = thickness
+            elif DEPTH_PROP in cu:
+                del cu[DEPTH_PROP]
+        if bevel is not None:
+            applied_b = float(cu.get(TEXT_BEVEL_PROP, 0.0))
+            if math.isclose(cu.bevel_depth, applied_b, abs_tol=1e-9):
+                cu.bevel_depth = bevel
+                if bevel > 0.0:
+                    cu.bevel_resolution = max(cu.bevel_resolution, 2)
+                    cu[TEXT_BEVEL_PROP] = bevel
+                elif TEXT_BEVEL_PROP in cu:
+                    del cu[TEXT_BEVEL_PROP]
+
+    def _apply_depth(self, ob: "bpy.types.Object", el: Element) -> None:
+        thickness = self.depth_for(el)
+        if ob.type == "MESH":
+            self._apply_solidify(ob, thickness)
+        elif ob.type == "FONT":
+            self._apply_extrude(ob.data, thickness, self.depths.get("text_bevel", 0.0) * self.opt.scale)
+        elif ob.type == "CURVE":
+            self._apply_extrude(ob.data, thickness)
+
+    def _back_shift(self, ob: "bpy.types.Object") -> Matrix:
+        """Local translation moving an extruded curve / text back so its front face stays where Figma put it."""
+        if ob.type in ("CURVE", "FONT") and ob.data.extrude > 0.0:
+            return Matrix.Translation((0.0, 0.0, -ob.data.extrude))
+        return Matrix.Identity(4)
+
+    def _screen_origin(self) -> "bpy.types.Object":
+        """The shared bend origin Empty at the frame centre, axes: X along the UI, Y into the screen, Z up."""
+        if self._curve_origin is None:
+            ob = self._stale_origin
+            self._stale_origin = None
+            if ob is None or ob.type != "EMPTY":
+                ob = bpy.data.objects.new(self.report.collection.name + " Curve Origin", None)
+                ob.empty_display_type = "SINGLE_ARROW"
+                ob.empty_display_size = 0.1
+                self.report.objects.append(ob)
+            ob[ELEM_ID_PROP] = CURVE_ORIGIN_ID
+            ob["figma_kind"] = "curve_origin"
+            if ob.name not in self.report.collection.objects:
+                self.report.collection.objects.link(ob)
+            b = self.scene.bounds or {"x": 0, "y": 0, "w": 0, "h": 0}
+            fx = (b["x"] + b["w"] / 2.0 - self.offset[0]) * self.opt.scale
+            fy = -(b["y"] + b["h"] / 2.0 - self.offset[1]) * self.opt.scale
+            # frame axes (x right, y up, z toward the viewer) -> origin axes (X right, Y into the screen, Z up)
+            frame_to_origin = Matrix(((1.0, 0.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, -1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
+            self._place(ob, self.base @ Matrix.Translation((fx, fy, 0.0)) @ frame_to_origin)
+            self._curve_origin = ob
+        return self._curve_origin
+
+    def _x_extent(self, el: Optional[Element], ob: "bpy.types.Object") -> float:
+        """Width of the object along the screen's x axis (metres), analytic from the element's rotated box."""
+        if el is not None:
+            a, b, _, _, _, _ = el.matrix
+            return (abs(a) * el.w + abs(b) * el.h) * self.opt.scale
+        xs = [(ob.matrix_world @ p.co).x for sp in ob.data.splines for p in sp.bezier_points]
+        xs += [(ob.matrix_world @ Vector(p.co[:3])).x for sp in ob.data.splines for p in sp.points]
+        return (max(xs) - min(xs)) if xs else 0.0
+
+    def _apply_screen(self, ob: "bpy.types.Object", el: Optional[Element]) -> None:
+        """Add / update / remove the *Screen Curve* Simple Deform (BEND) unless the user changed its angle.
+
+        Every object is bent by ``extent / radius`` over its own width around the
+        shared origin, so all of them lie on the same cylinder (negative angle:
+        edges come toward the viewer).  Deforming per object is an
+        approximation: an object is bent about its own vertices only, so very
+        wide objects with few vertices (a plain plane) stay faceted unless you
+        subdivide them.
+        """
+        mod = ob.modifiers.get(SCREEN_MODIFIER_NAME)
+        if mod is not None and mod.type != "SIMPLE_DEFORM":
+            mod = None
+        applied = ob.get(SCREEN_ANGLE_PROP)
+        if mod is not None and (applied is None or not math.isclose(mod.angle, float(applied), abs_tol=1e-9)):
+            return
+        extent = self._x_extent(el, ob)
+        if not self.opt.curve_screen or self.opt.curve_radius <= 0.0 or extent <= 0.0:
+            if mod is not None:
+                ob.modifiers.remove(mod)
+            if SCREEN_ANGLE_PROP in ob:
+                del ob[SCREEN_ANGLE_PROP]
+            return
+        if mod is None:
+            mod = ob.modifiers.new(SCREEN_MODIFIER_NAME, "SIMPLE_DEFORM")
+            mod.deform_method = "BEND"
+            mod.deform_axis = "Z"
+            mod.show_expanded = False
+        mod.origin = self._screen_origin()
+        mod.angle = -extent / self.opt.curve_radius
+        ob[SCREEN_ANGLE_PROP] = mod.angle
+
+    def _apply_3d(self, ob: "bpy.types.Object", el: Element) -> None:
+        self._apply_depth(ob, el)
+        self._apply_screen(ob, el)
+
     # -- element builders ---------------------------------------------------
 
     def build_group(self, el: Element, depth: int, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
@@ -1198,7 +1415,8 @@ class SceneBuilder:
         elif "figma_fill_approx" in ob:
             del ob["figma_fill_approx"]
         self._apply_stroke(ob, el)
-        self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
+        self._apply_3d(ob, el)
+        self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)) @ self._back_shift(ob))
         self._register_shared(el, ob, sig)
         return ob
 
@@ -1230,6 +1448,7 @@ class SceneBuilder:
             self.report.warnings.append("Could not load image %s for %r: %s" % (path, el.name, e))
             self._apply_material(mesh, self.materials.flat(el.fill or [0.5, 0.5, 0.5, 1.0], el.opacity))
         self._apply_stroke(ob, el)
+        self._apply_3d(ob, el)
         self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
         self._register_shared(el, ob, sig)
         return ob
@@ -1312,6 +1531,7 @@ class SceneBuilder:
         if old_curves and empty.get("figma_asset_hash") == digest and fit_prop is not None and len(fit_prop) == 16:
             fit = Matrix([tuple(fit_prop[i * 4 : i * 4 + 4]) for i in range(4)])
             self.report.objects.extend(old_curves)
+            curves = old_curves
         else:
             for o in old_curves:
                 data = o.data
@@ -1336,8 +1556,20 @@ class SceneBuilder:
                     bpy.data.collections.remove(c)
             empty["figma_asset_hash"] = digest
             empty["figma_icon_fit"] = [v for row in fit for v in row]
+            curves = objs
 
-        self._place(empty, self.matrix_for(el, depth, (0.0, 0.0)) @ fit)
+        # 3D: extrude the icon's curves (the SVG importer's paths are 2D curves) and bend them with the screen
+        thickness = self.depth_for(el)
+        extrude = 0.0
+        for ob in curves:
+            if ob.type == "CURVE":
+                self._apply_extrude(ob.data, thickness)
+                extrude = max(extrude, ob.data.extrude)
+        # the curves' own matrices come from the importer; the Empty carries the fit, so shift it back before the fit
+        self._place(empty, self.matrix_for(el, depth, (0.0, 0.0)) @ Matrix.Translation((0.0, 0.0, -extrude)) @ fit)
+        for ob in curves:
+            if ob.type == "CURVE":
+                self._apply_screen(ob, None)
         return empty
 
     # Text -----------------------------------------------------------------
@@ -1457,7 +1689,8 @@ class SceneBuilder:
         blender_baseline = self._text_probe() * cu.size  # relative to object origin, y up
         figma_baseline = -((float(lh) - fs) / 2.0 + TEXT_ASCENT_RATIO * fs) * s  # from box top, y up
         dy = figma_baseline - blender_baseline
-        self._place(ob, self.matrix_for(el, depth, (anchor_x, 0.0)) @ Matrix.Translation((0.0, dy, 0.0)))
+        self._apply_3d(ob, el)
+        self._place(ob, self.matrix_for(el, depth, (anchor_x, 0.0)) @ Matrix.Translation((0.0, dy, 0.0)) @ self._back_shift(ob))
         self._register_shared(el, ob, sig)
         return ob
 
@@ -1524,6 +1757,9 @@ class SceneBuilder:
             self.report.warnings.append("Unknown instance mode %r; using LINKED_DATA" % self.opt.instance_mode)
             self.opt.instance_mode = "LINKED_DATA"
         self._prepare_components()
+        self._stale_origin = self.existing.pop(CURVE_ORIGIN_ID, None)
+        if self.opt.curve_screen and self.opt.curve_radius > 0.0:
+            self._screen_origin()
 
         for depth, el in enumerate(self.scene.elements):
             if el.parent in self._collapsed:  # inside a collection instance: drawn by the instanced collection
@@ -1551,6 +1787,13 @@ class SceneBuilder:
         for ob in list(self.existing.values()):  # elements that vanished from Figma (or collapsed into an instance)
             self._retire(ob)
         self.existing.clear()
+        if self._stale_origin is not None:  # curved screen turned off: drop the origin unless a modifier still uses it
+            used = any(
+                m.type == "SIMPLE_DEFORM" and m.origin == self._stale_origin for c in self._own_collections() for o in c.objects for m in o.modifiers
+            )
+            if not used:
+                bpy.data.objects.remove(self._stale_origin)
+            self._stale_origin = None
         for c in list(coll.children):  # component collections left empty after a mode change
             if c.get(COMPONENT_PROP) and not c.objects and not c.children and c not in self._comp_colls.values():
                 bpy.data.collections.remove(c)

@@ -854,6 +854,196 @@ class BuilderTests(unittest.TestCase):
         self.assertIn(by_id2["I3:10;3:3"], list(removed.objects))
         self.assertEqual(report3.sync["moved"], 6)
 
+    # -- 3D presets and curved screen ---------------------------------------------
+
+    def _depth_mod(self, ob):
+        mod = ob.modifiers.get("Depth")
+        return mod if mod is not None and mod.type == "SOLIDIFY" else None
+
+    def test_flat_preset_adds_nothing(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG")
+        self.assertEqual(builder.resolve_depths("FLAT"), {k: 0.0 for k in builder.DEPTH_KINDS + ("text_bevel",)})
+        for ob in report.objects:
+            self.assertFalse([m for m in ob.modifiers if m.name in ("Depth", "Screen Curve")], ob.name)
+            if ob.type in ("CURVE", "FONT"):
+                self.assertEqual(ob.data.extrude, 0.0)
+                self.assertEqual(ob.data.bevel_depth, 0.0)
+            self.assertNotIn("figma_depth", ob)
+        self.assertNotIn("Page 1 Curve Origin", bpy.data.objects)
+
+    def test_card_preset_is_modifiers_and_curve_properties(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG", depth_preset="CARD")
+        sb = builder.SceneBuilder(scene, self.tmp, builder.BuildOptions(depth_preset="CARD"))
+        el = {e.id: e for e in scene.elements}
+        # kinds: frame background, button-like background (container with a TEXT child, < 400 px),
+        # plain rect / ellipse = shape, text, icon, image
+        self.assertEqual(sb.depth_kind(el["1:2:bg"]), "frame")  # Card 360x480: too big for a button
+        self.assertEqual(sb.depth_kind(el["1:11:bg"]), "button")  # Button 312x48 with Label
+        self.assertEqual(sb.depth_kind(el["3:10:bg"]), "button")  # component instance 140x40 with its label
+        self.assertEqual(sb.depth_kind(el["1:3"]), "shape")  # Header: first child of Card but not its size
+        self.assertEqual(sb.depth_kind(el["1:7"]), "shape")
+        self.assertEqual(sb.depth_kind(el["1:4"]), "text")
+        self.assertEqual(sb.depth_kind(el["1:13"]), "icon")
+        self.assertEqual(sb.depth_kind(el["1:8"]), "image")
+        # planes: Solidify "Depth" toward the back, even thickness, front face untouched
+        card = self._by_name(report, "Card (background)")
+        mod = self._depth_mod(card)
+        self.assertIsNotNone(mod)
+        self.assertAlmostEqual(mod.thickness, 0.008, places=9)
+        self.assertEqual(mod.offset, -1.0)
+        self.assertTrue(mod.use_even_offset)
+        self.assertAlmostEqual(card["figma_depth"], 0.008, places=9)
+        self.assertEqual(len(card.data.vertices), 4)  # nothing baked
+        self.assertAlmostEqual(self._depth_mod(self._by_name(report, "Button (background)")).thickness, 0.006, places=9)
+        self.assertAlmostEqual(self._depth_mod(self._by_name(report, "Header")).thickness, 0.003, places=9)
+        self.assertAlmostEqual(self._depth_mod(self._by_name(report, "Photo")).thickness, 0.003, places=9)
+        outlined = self._by_name(report, "Outlined card")
+        self.assertEqual([m.name for m in outlined.modifiers], ["Corner Radius", "Stroke", "Depth"])
+        ev = self._evaluated(outlined)
+        me = ev.to_mesh()
+        zs = [v.co.z for v in me.vertices]
+        ev.to_mesh_clear()
+        self.assertAlmostEqual(min(zs), -0.003, places=6)  # back
+        self.assertLessEqual(max(zs), 0.0001 + 1e-6)  # front face (and the lifted stroke) stay
+        # text: curve extrude (half per side) + bevel on the data, object shifted back so the front stays
+        title = self._by_name(report, "Title")
+        self.assertAlmostEqual(title.data.extrude, 0.00075, places=9)
+        self.assertAlmostEqual(title.data.bevel_depth, 0.00025, places=9)
+        self.assertAlmostEqual(title.data["figma_depth"], 0.0015, places=9)
+        self.assertFalse(self._depth_mod(title))
+        # ellipse and icon curves extrude too; the icon Empty is shifted back by the extrude
+        self.assertAlmostEqual(self._by_name(report, "Avatar bg").data.extrude, 0.0015, places=9)
+        arrow = self._by_name(report, "Arrow")
+        for curve in [o for o in report.objects if o.parent == arrow]:
+            self.assertAlmostEqual(curve.data.extrude, 0.00075, places=9)
+        # front faces stay where Figma put them: compare with a flat import of the same bundle
+        title_y, arrow_y, card_y = title.location.y, arrow.location.y, card.location.y
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        scene_f, report_f, _ = self._build("SVG")
+        flat_title = self._by_name(report_f, "Title")
+        flat_arrow = self._by_name(report_f, "Arrow")
+        flat_card = self._by_name(report_f, "Card (background)")
+        self.assertAlmostEqual(title_y - flat_title.location.y, 0.00075, places=9)  # back = +Y in XZ
+        self.assertAlmostEqual(arrow_y - flat_arrow.location.y, 0.00075, places=9)
+        self.assertAlmostEqual(card_y, flat_card.location.y, places=9)
+        # the same import in Flat orientation shifts along -Z (the viewer is at +Z)
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        _, report_xy, _ = self._build("SVG", orientation="XY", depth_preset="CARD")
+        title_z = self._by_name(report_xy, "Title").location.z
+        bpy.ops.wm.read_factory_settings(use_empty=True)
+        _, report_xy_flat, _ = self._build("SVG", orientation="XY")
+        self.assertAlmostEqual(title_z - self._by_name(report_xy_flat, "Title").location.z, -0.00075, places=9)
+
+    def test_custom_depths_override_preset(self):
+        from figma_to_blender import builder
+
+        self.assertEqual(builder.resolve_depths("SUBTLE", {"frame": 20, "text": None})["frame"], 20.0)
+        self.assertEqual(builder.resolve_depths("SUBTLE", {"frame": 20})["button"], 3.0)
+        self.assertEqual(builder.resolve_depths("CUSTOM", {"button": 5})["button"], 5.0)  # unknown preset = flat base
+        self.assertEqual(builder.resolve_depths("CUSTOM", {"button": 5})["frame"], 0.0)
+        scene, report, _ = self._build("SVG", depth_preset="SUBTLE", depths={"frame": 20.0, "text": 0.0})
+        self.assertAlmostEqual(self._depth_mod(self._by_name(report, "Card (background)")).thickness, 0.020, places=9)
+        self.assertAlmostEqual(self._depth_mod(self._by_name(report, "Button (background)")).thickness, 0.003, places=9)
+        self.assertEqual(self._by_name(report, "Title").data.extrude, 0.0)
+
+    def test_preset_sync_keeps_user_changes(self):
+        scene, report, _ = self._build("SVG")  # FLAT first
+        card = self._by_name(report, "Card (background)")
+        button = self._by_name(report, "Button (background)")
+        title = self._by_name(report, "Title")
+        body = self._by_name(report, "Body")
+        self.assertIsNone(self._depth_mod(card))
+        # switching to CARD on re-import adds the modifiers / properties in place
+        report2 = self._rebuild(scene, depth_preset="CARD")
+        self.assertEqual(report2.sync["created"], 0)
+        self.assertAlmostEqual(self._depth_mod(card).thickness, 0.008, places=9)
+        self.assertAlmostEqual(self._depth_mod(button).thickness, 0.006, places=9)
+        self.assertAlmostEqual(title.data.extrude, 0.00075, places=9)
+        self.assertAlmostEqual(body.data.extrude, 0.00075, places=9)
+        # the user tweaks two values ...
+        self._depth_mod(card).thickness = 0.02
+        title.data.extrude = 0.005
+        # ... SUBTLE updates everything else and leaves those two alone
+        self._rebuild(scene, depth_preset="SUBTLE")
+        self.assertAlmostEqual(self._depth_mod(card).thickness, 0.02, places=9)
+        self.assertAlmostEqual(self._depth_mod(button).thickness, 0.003, places=9)
+        self.assertAlmostEqual(title.data.extrude, 0.005, places=9)
+        self.assertAlmostEqual(body.data.extrude, 0.00025, places=9)
+        self.assertEqual(body.data.bevel_depth, 0.0)  # SUBTLE has no bevel: removed
+        # back to FLAT: importer values disappear, the user's stay
+        self._rebuild(scene, depth_preset="FLAT")
+        self.assertIsNone(self._depth_mod(button))
+        self.assertNotIn("figma_depth", button)
+        self.assertAlmostEqual(self._depth_mod(card).thickness, 0.02, places=9)
+        self.assertEqual(body.data.extrude, 0.0)
+        self.assertNotIn("figma_depth", body.data)
+        self.assertAlmostEqual(title.data.extrude, 0.005, places=9)
+        # a Solidify the user added under the same name is never touched
+        header = self._by_name(report, "Header")
+        own = header.modifiers.new("Depth", "SOLIDIFY")
+        own.thickness = 0.1
+        self._rebuild(scene, depth_preset="CARD")
+        self.assertAlmostEqual(header.modifiers["Depth"].thickness, 0.1, places=6)
+        self.assertEqual(len([m for m in header.modifiers if m.type == "SOLIDIFY"]), 1)
+
+    def test_curve_screen(self):
+        scene, report, _ = self._build("SVG", curve_screen=True, curve_radius=1.0)
+        origin = bpy.data.objects["Page 1 Curve Origin"]
+        self.assertEqual(origin.type, "EMPTY")
+        self.assertIn(origin, list(report.collection.objects))
+        self.assertEqual(origin["figma_elem_id"], "__curve_origin__")
+        # at the centre of the page bounds (x 100..720 -> 410 px), axes: X right, Y into the screen, Z up
+        self.assertAlmostEqual(origin.location.x, 0.410, places=6)
+        self.assertEqual(tuple(round(v, 6) for v in origin.matrix_world.to_3x3().col[2]), (0.0, 0.0, 1.0))
+        self.assertEqual(tuple(round(v, 6) for v in origin.matrix_world.to_3x3().col[1]), (0.0, 1.0, 0.0))
+        header = self._by_name(report, "Header")
+        mod = header.modifiers["Screen Curve"]
+        self.assertEqual(mod.type, "SIMPLE_DEFORM")
+        self.assertEqual(mod.deform_method, "BEND")
+        self.assertEqual(mod.deform_axis, "Z")
+        self.assertIs(mod.origin, origin)
+        self.assertAlmostEqual(mod.angle, -0.36, places=6)  # 360 px wide / 1 m
+        self.assertEqual([m.name for m in header.modifiers], ["Corner Radius", "Screen Curve"])
+        # the header's sharp bottom-left corner (page x 100 -> 0.31 m left of the centre) moves onto a
+        # cylinder around the origin: the header sits 1 mm in front of the origin plane (depth step),
+        # so its radius is 1 - 0.001; the edge comes toward the viewer (-Y)
+        ev = self._evaluated(header)
+        me = ev.to_mesh()
+        pts = [header.matrix_world @ v.co for v in me.vertices]
+        ev.to_mesh_clear()
+        left = min(pts, key=lambda p: p.x)
+        r = 1.0 + header.matrix_world.translation.y  # origin space y of the header plane (negative = toward the viewer)
+        self.assertAlmostEqual(r, 0.999, places=6)
+        self.assertAlmostEqual(left.x, 0.410 - r * math.sin(0.31), places=5)
+        self.assertAlmostEqual(left.y, r * math.cos(0.31) - 1.0, places=5)
+        self.assertLess(left.y, header.matrix_world.translation.y)  # concave: edges closer to the viewer than the centre
+        # every mesh / curve / text object is bent, Empties are not; text gets it too
+        for ob in report.objects:
+            if ob.type in ("MESH", "CURVE", "FONT"):
+                self.assertIn("Screen Curve", ob.modifiers, ob.name)
+                self.assertIs(ob.modifiers["Screen Curve"].origin, origin)
+            else:
+                self.assertNotIn("Screen Curve", ob.modifiers)
+        title = self._by_name(report, "Title")
+        self.assertAlmostEqual(title.modifiers["Screen Curve"].angle, -0.312, places=6)
+        # Depth sits before Screen Curve when both are on
+        report2 = self._rebuild(scene, curve_screen=True, curve_radius=0.5, depth_preset="CARD")
+        self.assertEqual([m.name for m in header.modifiers], ["Corner Radius", "Depth", "Screen Curve"])
+        self.assertAlmostEqual(header.modifiers["Screen Curve"].angle, -0.72, places=6)  # radius change synced
+        # user-changed angle is kept; turning the screen off removes the importer's modifiers and the origin
+        title.modifiers["Screen Curve"].angle = -1.0
+        self._rebuild(scene, curve_screen=False)
+        self.assertNotIn("Screen Curve", header.modifiers)
+        self.assertIn("Screen Curve", title.modifiers)
+        self.assertIn("Page 1 Curve Origin", bpy.data.objects)  # still referenced by the user's modifier
+        title.modifiers.remove(title.modifiers["Screen Curve"])
+        self._rebuild(scene, curve_screen=False)
+        self.assertNotIn("Page 1 Curve Origin", bpy.data.objects)
+
     @staticmethod
     def _cancelled(op):
         try:

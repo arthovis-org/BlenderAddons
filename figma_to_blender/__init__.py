@@ -180,6 +180,37 @@ if bpy is not None:
             ],
             default="LINKED_DATA",
         )
+        depth_preset: EnumProperty(
+            name="3D preset",
+            description="Give the flat UI some depth, all through modifiers and curve properties (nothing baked): "
+            "planes get a 'Depth' Solidify modifier growing toward the back, text / ellipses / icon curves get curve extrude",
+            items=[
+                ("FLAT", "Flat", "Plain 2D import (no depth)"),
+                ("SUBTLE", "Subtle", "Frames 2 px, buttons 3 px, shapes 1 px, text and icons 0.5 px, images 1 px"),
+                ("CARD", "Card", "Frames 8 px, buttons 6 px, shapes 3 px, text and icons 1.5 px, images 3 px, text bevel 0.25 px"),
+                ("CUSTOM", "Custom", "Use the per-kind depths below (Figma px, converted with the scale)"),
+            ],
+            default="FLAT",
+        )
+        depth_frame: FloatProperty(name="Frame / background", description="Depth (px) of frame background planes", default=8.0, min=0.0)
+        depth_button: FloatProperty(
+            name="Button",
+            description="Depth (px) of button-like backgrounds: a container smaller than 400 px with a text child",
+            default=6.0,
+            min=0.0,
+        )
+        depth_shape: FloatProperty(name="Rectangle / ellipse", description="Depth (px) of plain rectangles and ellipses", default=3.0, min=0.0)
+        depth_text: FloatProperty(name="Text", description="Text extrude (px, total thickness)", default=1.5, min=0.0)
+        depth_icon: FloatProperty(name="Icon", description="Extrude (px) of SVG icon curves / depth of icon planes", default=1.5, min=0.0)
+        depth_image: FloatProperty(name="Image", description="Depth (px) of image planes", default=3.0, min=0.0)
+        text_bevel: FloatProperty(name="Text bevel", description="Bevel depth (px) on text curves", default=0.25, min=0.0)
+        curve_screen: BoolProperty(
+            name="Curve screen",
+            description="Bend every object around a shared '<collection> Curve Origin' Empty at the frame centre "
+            "('Screen Curve' Simple Deform modifiers) so the UI wraps onto a cylinder facing the viewer",
+            default=False,
+        )
+        curve_radius: FloatProperty(name="Radius", description="Cylinder radius in metres", default=1.0, min=0.01, unit="LENGTH")
         bundle_dir: StringProperty(name="Bundle folder", description="Folder containing scene.json and assets/", subtype="DIR_PATH")
         export_dir: StringProperty(name="Export to", description="Folder to write the bundle into", subtype="DIR_PATH")
 
@@ -195,6 +226,22 @@ if bpy is not None:
             remove_missing=s.remove_missing,
             link_instances=s.link_instances,
             instance_mode=s.instance_mode,
+            depth_preset=s.depth_preset,
+            depths=(
+                {
+                    "frame": s.depth_frame,
+                    "button": s.depth_button,
+                    "shape": s.depth_shape,
+                    "text": s.depth_text,
+                    "icon": s.depth_icon,
+                    "image": s.depth_image,
+                    "text_bevel": s.text_bevel,
+                }
+                if s.depth_preset == "CUSTOM"
+                else None
+            ),
+            curve_screen=s.curve_screen,
+            curve_radius=s.curve_radius,
         )
 
     def export_options(s: "FIGMA_settings") -> scene_model.ExportOptions:
@@ -412,6 +459,19 @@ if bpy is not None:
             box.label(text="Component instances", icon="LINKED")
             box.prop(s, "link_instances")
             box.prop(s, "instance_mode", text="Mode")
+
+            box = layout.box()
+            box.label(text="3D", icon="MOD_SOLIDIFY")
+            box.prop(s, "depth_preset")
+            if s.depth_preset == "CUSTOM":
+                col = box.column(align=True)
+                for name in ("depth_frame", "depth_button", "depth_shape", "depth_text", "depth_icon", "depth_image", "text_bevel"):
+                    col.prop(s, name)
+            row = box.row(align=True)
+            row.prop(s, "curve_screen")
+            sub = row.row()
+            sub.active = s.curve_screen
+            sub.prop(s, "curve_radius")
             layout.operator(FIGMA_OT_import_page.bl_idname, icon="IMPORT")
 
             box = layout.box()
