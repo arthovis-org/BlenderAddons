@@ -1,4 +1,4 @@
-"""Convert a Figma page node tree into a compact intermediate *scene bundle*.
+"""Convert a Figma node tree (a page or a single frame) into a *scene bundle*.
 
 The bundle is a folder containing ``scene.json`` (a flat list of elements in
 draw order with world transforms) and an ``assets/`` directory with the SVG /
@@ -76,9 +76,18 @@ class Element:
 
 @dataclass
 class Scene:
+    """A flat, draw-ordered list of elements plus metadata about their root.
+
+    ``page_id`` / ``page_name`` hold the *root node* the scene was built from:
+    a CANVAS when a whole page was imported, or the frame / group / node that
+    was imported on its own (``root_type`` tells which).  The field names are
+    kept for ``scene.json`` compatibility with bundles written by v0.1.
+    """
+
     page_id: str
     page_name: str
     file_key: str = ""
+    root_type: str = "CANVAS"
     elements: List[Element] = field(default_factory=list)
     bounds: Optional[Dict[str, float]] = None
     options: Dict[str, Any] = field(default_factory=dict)
@@ -90,6 +99,7 @@ class Scene:
             "file_key": self.file_key,
             "page_id": self.page_id,
             "page_name": self.page_name,
+            "root_type": self.root_type,
             "bounds": self.bounds,
             "options": self.options,
             "warnings": self.warnings,
@@ -229,12 +239,14 @@ def node_size(node: dict) -> Tuple[float, float]:
     return float(bb.get("width", 0.0)), float(bb.get("height", 0.0))
 
 
-def node_local_matrix(node: dict, parent_world: Matrix) -> Matrix:
-    """World matrix for ``node``.
+def node_local_matrix(node: dict, parent_world: Matrix, page_to_scene: Matrix = IDENTITY) -> Matrix:
+    """World (scene) matrix for ``node``.
 
     Uses ``relativeTransform`` (composed with the parent's world matrix) when
     available, otherwise falls back to ``absoluteBoundingBox`` which is already
-    in page coordinates and carries no rotation.
+    in *page* coordinates and carries no rotation; ``page_to_scene`` maps page
+    coordinates into the scene (identity for a whole-page import, a translation
+    when a single frame is imported with its corner at the origin).
     """
     rt = node.get("relativeTransform")
     if rt and node.get("size"):
@@ -243,7 +255,7 @@ def node_local_matrix(node: dict, parent_world: Matrix) -> Matrix:
         except (TypeError, ValueError):
             pass
     bb = node.get("absoluteBoundingBox") or {}
-    return (1.0, 0.0, float(bb.get("x", 0.0)), 0.0, 1.0, float(bb.get("y", 0.0)))
+    return mat_mul(page_to_scene, (1.0, 0.0, float(bb.get("x", 0.0)), 0.0, 1.0, float(bb.get("y", 0.0))))
 
 
 def _subtree_is_vector_like(node: dict) -> bool:
@@ -308,6 +320,8 @@ class SceneBuilder:
         self.elements: List[Element] = []
         self.warnings: List[str] = []
         self._ids_seen: Dict[str, int] = {}
+        # Maps Figma page coordinates to scene coordinates (see build_scene / root_origin_matrix).
+        self.page_to_scene: Matrix = IDENTITY
 
     def _unique_id(self, nid: str) -> str:
         n = self._ids_seen.get(nid, 0)
@@ -340,7 +354,7 @@ class SceneBuilder:
         if not is_visible(node):
             return
         t = node.get("type")
-        world = node_local_matrix(node, parent_world)
+        world = node_local_matrix(node, parent_world, self.page_to_scene)
         opts = self.options
 
         if t == "TEXT":
@@ -403,17 +417,51 @@ class SceneBuilder:
         self.warnings.append("Skipped unsupported node type %s (%r)" % (t, node.get("name")))
 
 
-def build_scene(page_node: dict, options: Optional[ExportOptions] = None, file_key: str = "") -> Scene:
-    """Convert a CANVAS node (from ``/files/{key}/nodes``) into a :class:`Scene`."""
+def root_origin_matrix(root: dict) -> Matrix:
+    """Parent matrix that moves ``root``'s top-left corner to ``(0, 0)``.
+
+    A node fetched on its own from ``/files/{key}/nodes`` still carries the
+    ``relativeTransform`` it has inside its parent (or, without one, its
+    ``absoluteBoundingBox``), so a lone frame would otherwise be imported at
+    its page coordinates.  Only the translation is cancelled: the root keeps
+    its own Figma rotation / flip so the import looks like the Figma canvas.
+    The same matrix is used as ``page_to_scene`` for descendants that only
+    have an ``absoluteBoundingBox``.
+    """
+    _, _, tx, _, _, ty = node_local_matrix(root, IDENTITY)
+    return (1.0, 0.0, -tx, 0.0, 1.0, -ty)
+
+
+def build_scene(root_node: dict, options: Optional[ExportOptions] = None, file_key: str = "") -> Scene:
+    """Convert a node tree (from ``/files/{key}/nodes``) into a :class:`Scene`.
+
+    ``root_node`` may be a whole page (CANVAS): its children become the
+    top-level elements in page coordinates, exactly as before.  Any other node
+    (a frame, section, group, component...) is imported on its own: the node
+    itself becomes the first element, so a frame's fill and corner radius turn
+    into its background plane and its children are parented under it, and the
+    tree is translated so the root's top-left corner sits at ``(0, 0)`` (see
+    :func:`root_origin_matrix`).  The root's own rotation is kept.
+    """
     options = options or ExportOptions()
     sb = SceneBuilder(options)
-    for child in page_node.get("children") or []:
-        sb.walk(child, None, IDENTITY)
+    root_type = root_node.get("type", "") or "CANVAS"
+    if root_type == "CANVAS":
+        for child in root_node.get("children") or []:
+            sb.walk(child, None, IDENTITY)
+    else:
+        if not is_visible(root_node):
+            sb.warnings.append("Root node %r is hidden in Figma; importing it anyway" % root_node.get("name"))
+            root_node = dict(root_node, visible=True)
+        origin = root_origin_matrix(root_node)
+        sb.page_to_scene = origin
+        sb.walk(root_node, None, origin)
 
     scene = Scene(
-        page_id=page_node.get("id", ""),
-        page_name=page_node.get("name", "Figma Page"),
+        page_id=root_node.get("id", ""),
+        page_name=root_node.get("name", "Figma Page"),
         file_key=file_key,
+        root_type=root_type,
         elements=sb.elements,
         options=asdict(options),
         warnings=sb.warnings,
@@ -521,6 +569,7 @@ def scene_from_dict(data: Dict[str, Any]) -> Scene:
         page_id=data.get("page_id", ""),
         page_name=data.get("page_name", "Figma Page"),
         file_key=data.get("file_key", ""),
+        root_type=data.get("root_type", "CANVAS"),
         elements=elements,
         bounds=data.get("bounds"),
         options=data.get("options") or {},
@@ -531,13 +580,18 @@ def scene_from_dict(data: Dict[str, Any]) -> Scene:
 def export_bundle(
     client: FigmaClient,
     file_key: str,
-    page_id: str,
+    node_id: str,
     out_dir: str,
     options: Optional[ExportOptions] = None,
 ) -> Scene:
-    """Fetch a page, convert it and download its assets into ``out_dir``."""
-    page = client.get_page(file_key, page_id)
-    scene = build_scene(page, options, file_key=file_key)
+    """Fetch a page or any single node, convert it and download its assets into ``out_dir``.
+
+    ``node_id`` is a CANVAS id for a whole page or the id of a frame / group /
+    node (``12:345``, see :func:`figma_api.parse_node_id`) to import just that
+    subtree with its top-left corner at the origin.
+    """
+    root = client.get_node(file_key, node_id)
+    scene = build_scene(root, options, file_key=file_key)
     export_assets(client, file_key, scene, out_dir)
     write_scene(scene, out_dir)
     return scene

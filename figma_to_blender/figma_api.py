@@ -20,13 +20,14 @@ from typing import Dict, Iterable, List, Optional
 log = logging.getLogger(__name__)
 
 API_ROOT = "https://api.figma.com/v1"
-USER_AGENT = "figma_to_blender/0.1 (+https://github.com/arthovis-org/empty1)"
+USER_AGENT = "figma_to_blender/0.2 (+https://github.com/arthovis-org/BlenderAddons)"
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 _KEY_RE = re.compile(r"figma\.com/(?:design|file|proto|board)/([A-Za-z0-9]+)")
+_NODE_ID_RE = re.compile(r"^[A-Za-z]?\d+[:\-]\d+(?:;\d+[:\-]\d+)*$")
 
 
 class FigmaError(Exception):
@@ -54,6 +55,31 @@ def parse_file_key(url_or_key: str) -> str:
         raise ValueError("Could not find a file key in URL: %r" % s)
     # Bare key: strip anything after a slash or query string just in case.
     return re.split(r"[/?#]", s)[0]
+
+
+def parse_node_id(url_or_id: str) -> Optional[str]:
+    """Return a Figma node id in its ``12:345`` form, or ``None``.
+
+    Accepts a raw id (``12:345``, the URL spelling ``12-345``, instance ids
+    such as ``I12:3;45:6``) or any Figma URL carrying a ``node-id=`` query
+    parameter (*Copy link to selection* in Figma produces
+    ``...?node-id=12-345&...``; Figma writes ``-`` for ``:`` in URLs).
+    """
+    s = (url_or_id or "").strip()
+    if not s:
+        return None
+    if "figma.com" in s or "node-id=" in s or "://" in s:
+        try:
+            query = urllib.parse.urlparse(s).query
+        except ValueError:
+            return None
+        values = urllib.parse.parse_qs(query).get("node-id")
+        if not values or not values[0].strip():
+            return None
+        s = values[0].strip()
+    if not _NODE_ID_RE.match(s):
+        return None
+    return s.replace("-", ":")
 
 
 def sanitize_id(node_id: str) -> str:
@@ -160,20 +186,42 @@ class FigmaClient:
                 pages.append({"id": child["id"], "name": child.get("name", child["id"])})
         return pages
 
-    def get_page(self, file_key: str, page_id: str) -> dict:
-        """Fetch the full node tree of a page with ``geometry=paths``.
+    def get_node(self, file_key: str, node_id: str, depth: Optional[int] = None) -> dict:
+        """Fetch the node tree rooted at ``node_id`` with ``geometry=paths``.
 
-        Returns the CANVAS node (``document`` of the nodes response).
+        Works for a page (CANVAS) as well as for any frame / group / node
+        inside it.  Returns the node itself (``document`` of the nodes
+        response).  ``depth`` limits how many levels below the node are
+        returned (``None`` = the whole subtree).
         """
-        data = self._get_json(
-            "/files/%s/nodes" % file_key,
-            {"ids": page_id, "geometry": "paths"},
-        )
+        params = {"ids": node_id, "geometry": "paths"}
+        if depth is not None:
+            params["depth"] = str(int(depth))
+        data = self._get_json("/files/%s/nodes" % file_key, params)
         nodes = data.get("nodes") or {}
-        entry = nodes.get(page_id)
+        entry = nodes.get(node_id)
         if not entry or not entry.get("document"):
-            raise FigmaError("Page %s not found in file %s" % (page_id, file_key))
+            raise FigmaError("Node %s not found in file %s" % (node_id, file_key))
         return entry["document"]
+
+    def get_page(self, file_key: str, page_id: str) -> dict:
+        """Fetch the full node tree of a page (alias of :meth:`get_node`)."""
+        return self.get_node(file_key, page_id)
+
+    def list_top_level_frames(self, file_key: str, page_id: str) -> List[dict]:
+        """Return ``[{"id", "name", "type"}, ...]`` for a page's direct children.
+
+        Uses ``GET /files/{key}/nodes?ids={page}&depth=1`` so only one level is
+        transferred.  Every visible direct child is listed (frames, sections,
+        components, groups...), in the page's layer order.
+        """
+        page = self.get_node(file_key, page_id, depth=1)
+        frames = []
+        for child in page.get("children") or []:
+            if child.get("visible", True) is False:
+                continue
+            frames.append({"id": child["id"], "name": child.get("name", child["id"]), "type": child.get("type", "")})
+        return frames
 
     def export_images(
         self,
