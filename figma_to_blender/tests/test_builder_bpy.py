@@ -424,6 +424,149 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(report.counts["icon"], 4 + 1)  # Rating falls back to its solid fill
         self.assertTrue(any("image_1_8.png" in w for w in report.warnings))
 
+    # -- re-import / sync by Figma id ------------------------------------------
+
+    def _rebuild(self, scene, **extra):
+        """Write ``scene`` over the bundle and build it again into the same Blender scene."""
+        from figma_to_blender import builder
+
+        write_scene(scene, self.tmp)
+        opts = builder.BuildOptions(scale=0.001, depth_step=0.0005, icon_mode="SVG", center=False, **extra)
+        return builder.build_scene(load_scene(self.tmp), self.tmp, opts)
+
+    def test_reimport_updates_in_place_without_duplicates(self):
+        scene, report, _ = self._build("SVG")
+        coll = report.collection
+        n_objects, n_collections = len(coll.objects), len(bpy.data.collections)
+        pointers = {o.name: o.as_pointer() for o in coll.objects}
+        self.assertEqual(report.sync["created"], len(scene.elements))  # icon curves are not elements
+        self.assertEqual(report.sync["updated"], 0)
+        report2 = self._rebuild(scene)
+        self.assertIs(report2.collection, coll)
+        self.assertEqual(len(coll.objects), n_objects)
+        self.assertEqual(len(bpy.data.collections), n_collections)  # no "Page 1.001", no removed collection
+        self.assertEqual(report2.sync, {"created": 0, "updated": len(scene.elements), "moved": 0, "removed": 0})
+        self.assertEqual(report2.counts, report.counts)
+        self.assertEqual({o.name: o.as_pointer() for o in coll.objects}, pointers)  # same objects, same names
+        self.assertFalse([o for o in bpy.data.objects if o.name.endswith(".001")])
+        # materials were reused by name, not duplicated
+        self.assertFalse([m for m in bpy.data.materials if m.name.startswith("Figma") and m.name.endswith(".001")])
+        self.assertIn("sync: updated %d" % len(scene.elements), report2.summary())
+        # the icon curves were kept (same SVG), still parented under their Empty
+        arrow = self._by_name(report2, "Arrow")
+        self.assertEqual(len([o for o in coll.objects if o.parent == arrow]), 2)
+        lo, hi = obj_bbox([o for o in coll.objects if o.parent == arrow])
+        self.assertAlmostEqual(hi.x - lo.x, 0.024, places=4)
+        self.assertAlmostEqual(lo.x, 0.394, places=4)
+
+    def test_reimport_applies_figma_changes_and_keeps_user_edits(self):
+        from figma_to_blender import builder
+
+        scene, report, _ = self._build("SVG")
+        coll = report.collection
+        header = self._by_name(report, "Header")
+        title = self._by_name(report, "Title")
+        button_bg = self._by_name(report, "Button (background)")
+        card_bg = self._by_name(report, "Card (background)")
+        rating = self._by_name(report, "Rating")
+        photo = self._by_name(report, "Photo")
+        old_button_mat = button_bg.data.materials[0]
+        old_header_mat = header.data.materials[0]
+        # user edits: an extra modifier, a swapped material, custom props, a font change
+        header.modifiers.new("Solidify", "SOLIDIFY")
+        user_mat = bpy.data.materials.new("My card material")
+        card_bg.data.materials[0] = user_mat
+        header["my_note"] = "keep me"
+        header.data.materials[0] = header.data.materials[0]  # importer material stays -> managed
+        # Figma edits: move + resize the header, retext the title, recolour the button, drop the
+        # star, add a rectangle, change the ellipse size, change the photo's asset
+        el_header = next(e for e in scene.elements if e.id == "1:3")
+        el_header.matrix[2] += 10.0
+        el_header.x += 10.0
+        el_header.w = 300.0
+        el_header.corner_radii = [8.0, 8.0, 8.0, 8.0]
+        next(e for e in scene.elements if e.id == "1:4").text["characters"] = "Hello again"
+        next(e for e in scene.elements if e.id == "1:11:bg").fill = [0.0, 0.5, 0.0, 1.0]
+        next(e for e in scene.elements if e.id == "1:7").w = 80.0
+        scene.elements = [e for e in scene.elements if e.id != "1:17"]
+        from figma_to_blender.scene_model import Element
+
+        new_rect = Element(
+            id="9:9", name="Added rect", kind="rect", figma_type="RECTANGLE", parent="1:2", x=110, y=210, w=50, h=20,
+            rotation=0.0, matrix=[1, 0, 110, 0, 1, 210], fill=[1.0, 0.0, 0.0, 1.0],
+        )
+        scene.elements.append(new_rect)
+        with open(os.path.join(self.tmp, "assets", "image_1_8.png"), "ab") as fh:
+            fh.write(b"\x00")  # different bytes -> different hash (Blender ignores trailing junk)
+        n_before = len(coll.objects)
+
+        report2 = self._rebuild(scene)
+        self.assertEqual(report2.sync["created"], 1)
+        self.assertEqual(report2.sync["moved"], 1)
+        self.assertEqual(report2.sync["removed"], 0)
+        self.assertEqual(report2.sync["updated"], len(scene.elements) - 1)
+        self.assertEqual(len(coll.objects), n_before - 3 + 1)  # star Empty + its 2 curves moved out, 1 added
+        # header: same object, moved, resized, radius updated, Solidify + custom prop kept, modifier order kept
+        self.assertIs(self._by_name(report2, "Header"), header)
+        self.assertAlmostEqual(header.location.x, (100 + 10 + 150) * 0.001, places=6)
+        self.assertAlmostEqual(header.dimensions.x, 0.300, places=6)
+        self.assertEqual(len(header.data.vertices), 4)
+        self.assertEqual([m.name for m in header.modifiers], ["Corner Radius", "Solidify"])
+        self.assertAlmostEqual(header.modifiers["Corner Radius"].width, 0.008, places=6)
+        self.assertEqual(builder.vertex_bevel_weights(header.data), [1.0] * 4)
+        self.assertEqual(header["my_note"], "keep me")
+        self.assertIs(header.data.materials[0], old_header_mat)
+        # text updated in place
+        self.assertIs(self._by_name(report2, "Title"), title)
+        self.assertEqual(title.data.body, "Hello again")
+        # importer material swapped for the new colour, user material left alone
+        self.assertIsNot(button_bg.data.materials[0], old_button_mat)
+        self.assertEqual(tuple(round(c, 2) for c in button_bg.data.materials[0].diffuse_color[:3]), (0.0, 0.5, 0.0))
+        self.assertIs(card_bg.data.materials[0], user_mat)
+        # ellipse resized through its control points, same curve datablock
+        avatar = self._by_name(report2, "Avatar bg")
+        self._evaluated(avatar)  # refresh the bound box
+        self.assertAlmostEqual(avatar.dimensions.x, 0.080, places=6)
+        self.assertEqual(len(avatar.data.splines[0].bezier_points), 4)
+        # image asset changed -> new image datablock on the same plane
+        self.assertIs(self._by_name(report2, "Photo"), photo)
+        # removed element parked in the removed sub-collection, still in the file
+        removed = bpy.data.collections.get("Page 1 (removed)")
+        self.assertIsNotNone(removed)
+        self.assertIn(removed, list(coll.children))
+        self.assertIn(rating, list(removed.objects))
+        self.assertNotIn(rating, list(coll.objects))
+        self.assertTrue(all(o.parent == rating for o in removed.objects if o != rating))  # its curves went with it
+        # the new element was created and parented like a fresh import
+        added = self._by_name(report2, "Added rect")
+        self.assertEqual(added["figma_elem_id"], "9:9")
+        self.assertEqual(added.parent.name, "Card")
+        self.assertIn("Corner Radius", added.modifiers)
+        # a third import with remove_missing deletes the element that vanished this time
+        scene.elements = [e for e in scene.elements if e.id != "9:9"]
+        report3 = self._rebuild(scene, remove_missing=True)
+        self.assertEqual(report3.sync["removed"], 1)
+        self.assertNotIn("Added rect", bpy.data.objects)
+
+    def test_reimport_can_be_disabled(self):
+        scene, report, _ = self._build("SVG")
+        n = len(bpy.data.objects)
+        report2 = self._rebuild(scene, update_existing=False)
+        self.assertIsNot(report2.collection, report.collection)
+        self.assertEqual(report2.sync["updated"], 0)
+        self.assertEqual(len(bpy.data.objects), 2 * n)
+
+    def test_reimport_matches_legacy_objects_without_elem_id(self):
+        scene, report, _ = self._build("SVG")
+        for ob in report.collection.objects:
+            if "figma_elem_id" in ob:
+                del ob["figma_elem_id"]
+        n = len(report.collection.objects)
+        report2 = self._rebuild(scene)
+        self.assertEqual(report2.sync["created"], 0)
+        self.assertEqual(len(report.collection.objects), n)
+        self.assertEqual(self._by_name(report2, "Card (background)")["figma_elem_id"], "1:2:bg")
+
     @staticmethod
     def _cancelled(op):
         try:

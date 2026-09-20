@@ -25,6 +25,7 @@ colour lives in the material.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -47,6 +48,9 @@ CORNER_MODIFIER_NAME = "Corner Radius"
 BEVEL_WEIGHT_ATTR = "bevel_weight_vert"  # mesh attribute holding per-vertex bevel weights
 BEZIER_CIRCLE_K = 0.5522847498  # handle length / radius for a 4-point Bezier circle
 TEXT_ASCENT_RATIO = 0.8  # approximate ascender / font size used to place Figma baselines
+MANAGED_PROP = "figma_managed"  # custom property marking materials the importer created (re-sync may swap them)
+ELEM_ID_PROP = "figma_elem_id"  # exact scene element id (``figma_id`` plus ``:bg`` / ``#n`` suffixes) used by re-sync
+REMOVED_SUFFIX = " (removed)"  # sub-collection receiving objects whose Figma element disappeared
 
 
 @dataclass
@@ -58,6 +62,8 @@ class BuildOptions:
     center: bool = True  # put the page bounds' centre at the world origin
     corner_segments: int = CORNER_SEGMENTS  # Bevel modifier segments for rounded corners
     collection_name: Optional[str] = None
+    update_existing: bool = True  # re-sync: update objects of an earlier import of the same page/frame in place
+    remove_missing: bool = False  # re-sync: delete objects whose element vanished (default: move to "<root> (removed)")
 
 
 @dataclass
@@ -67,6 +73,8 @@ class BuildReport:
     missing_fonts: List[str] = field(default_factory=list)
     objects: List["bpy.types.Object"] = field(default_factory=list)
     collection: Optional["bpy.types.Collection"] = None
+    # re-sync tallies: created / updated (in place) / moved (to the removed collection) / removed (deleted)
+    sync: Dict[str, int] = field(default_factory=lambda: {"created": 0, "updated": 0, "moved": 0, "removed": 0})
 
     def bump(self, kind: str) -> None:
         self.counts[kind] = self.counts.get(kind, 0) + 1
@@ -74,6 +82,8 @@ class BuildReport:
     def summary(self) -> str:
         parts = ["%s=%d" % kv for kv in sorted(self.counts.items())]
         s = "Imported " + (", ".join(parts) if parts else "nothing")
+        if any(self.sync.get(k) for k in ("updated", "moved", "removed")):
+            s += "; sync: " + ", ".join("%s %d" % (k, self.sync[k]) for k in ("created", "updated", "moved", "removed") if self.sync.get(k))
         if self.missing_fonts:
             s += "; fonts not found: " + ", ".join(sorted(set(self.missing_fonts)))
         if self.warnings:
@@ -132,17 +142,36 @@ def _link_with_alpha(nodes, links, shader, out, alpha_socket=None, alpha_value: 
     links.new(mix.outputs[0], out.inputs["Surface"])
 
 
+def is_managed_material(mat: Optional["bpy.types.Material"]) -> bool:
+    """True for materials the importer made (re-sync may swap them; user materials are left alone)."""
+    return mat is not None and (bool(mat.get(MANAGED_PROP)) or mat.name.startswith("Figma "))
+
+
+def _new_managed_material(name: str) -> "bpy.types.Material":
+    mat = bpy.data.materials.new(name)
+    mat[MANAGED_PROP] = True
+    return mat
+
+
 class MaterialCache:
+    """Materials shared per colour / image, reused across imports by their deterministic name."""
+
     def __init__(self):
         self._flat: Dict[Tuple[int, int, int, int], "bpy.types.Material"] = {}
         self._image: Dict[Tuple[str, int], "bpy.types.Material"] = {}
+
+    @staticmethod
+    def _existing(name: str) -> Optional["bpy.types.Material"]:
+        mat = bpy.data.materials.get(name)
+        return mat if is_managed_material(mat) else None
 
     def flat(self, color, alpha: float) -> "bpy.types.Material":
         r, g, b = (float(c) for c in color[:3])
         key = (round(r * 255), round(g * 255), round(b * 255), round(alpha * 255))
         mat = self._flat.get(key)
         if mat is None:
-            mat = make_flat_material("Figma %02X%02X%02X a%d" % key, (r, g, b), alpha)
+            name = "Figma %02X%02X%02X a%d" % key
+            mat = self._existing(name) or make_flat_material(name, (r, g, b), alpha)
             self._flat[key] = mat
         return mat
 
@@ -150,14 +179,15 @@ class MaterialCache:
         key = (image.name, round(alpha * 255))
         mat = self._image.get(key)
         if mat is None:
-            mat = make_image_material("Figma img " + image.name, image, alpha)
+            name = "Figma img %s a%d" % (image.name, key[1])
+            mat = self._existing(name) or make_image_material(name, image, alpha)
             self._image[key] = mat
         return mat
 
 
 def make_flat_material(name: str, color, alpha: float = 1.0) -> "bpy.types.Material":
     """Unlit (emission) material of a single colour, optionally transparent."""
-    mat = bpy.data.materials.new(name)
+    mat = _new_managed_material(name)
     r, g, b = (float(c) for c in color[:3])
     nodes, links, em, out = _emission_output(mat)
     em.inputs["Color"].default_value = (r, g, b, 1.0)
@@ -169,7 +199,7 @@ def make_flat_material(name: str, color, alpha: float = 1.0) -> "bpy.types.Mater
 
 def make_image_material(name: str, image: "bpy.types.Image", alpha: float = 1.0) -> "bpy.types.Material":
     """Unlit material showing ``image`` with its own alpha (times ``alpha``)."""
-    mat = bpy.data.materials.new(name)
+    mat = _new_managed_material(name)
     nodes, links, em, out = _emission_output(mat)
     tex = nodes.new("ShaderNodeTexImage")
     tex.location = (-300, 0)
@@ -195,17 +225,29 @@ def plane_mesh(name: str, w: float, h: float) -> "bpy.types.Mesh":
     Vertex order follows Figma's corner order ``[tl, tr, br, bl]`` so that
     ``rectangleCornerRadii`` maps 1:1 onto vertex bevel weights.
     """
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata([(0.0, 0.0, 0.0)] * 4, [], [(0, 3, 2, 1)])  # counter-clockwise -> normal towards +Z (the viewer)
+    mesh.uv_layers.new(name="UVMap")
+    set_plane_geometry(mesh, w, h)
+    return mesh
+
+
+def is_plane_mesh(mesh: "bpy.types.Mesh") -> bool:
+    return len(mesh.vertices) == 4 and len(mesh.polygons) == 1
+
+
+def set_plane_geometry(mesh: "bpy.types.Mesh", w: float, h: float) -> None:
+    """Resize a :func:`plane_mesh` in place (vertices + UVs), keeping the datablock and its users."""
     hw, hh = w / 2.0, h / 2.0
     verts = [(-hw, hh, 0.0), (hw, hh, 0.0), (hw, -hh, 0.0), (-hw, -hh, 0.0)]  # tl, tr, br, bl
-    mesh = bpy.data.meshes.new(name)
-    mesh.from_pydata(verts, [], [(0, 3, 2, 1)])  # counter-clockwise -> normal towards +Z (the viewer)
-    uv = mesh.uv_layers.new(name="UVMap")
+    for v, co in zip(mesh.vertices, verts):
+        v.co = co
+    uv = mesh.uv_layers.active or (mesh.uv_layers[0] if mesh.uv_layers else mesh.uv_layers.new(name="UVMap"))
     for poly in mesh.polygons:
         for li in poly.loop_indices:
             x, y, _ = mesh.vertices[mesh.loops[li].vertex_index].co
             uv.data[li].uv = ((x + hw) / w if w else 0.5, (y + hh) / h if h else 0.5)
     mesh.update()
-    return mesh
 
 
 def set_vertex_bevel_weights(mesh: "bpy.types.Mesh", weights: List[float]) -> None:
@@ -253,13 +295,15 @@ def add_corner_radius_modifier(
     """
     width, weights = corner_radius_weights(w, h, radii)
     set_vertex_bevel_weights(ob.data, weights)
-    mod = ob.modifiers.new(CORNER_MODIFIER_NAME, "BEVEL")
-    mod.affect = "VERTICES"
-    mod.limit_method = "WEIGHT"
-    mod.offset_type = "OFFSET"
+    mod = ob.modifiers.get(CORNER_MODIFIER_NAME)
+    if mod is None or mod.type != "BEVEL":
+        mod = ob.modifiers.new(CORNER_MODIFIER_NAME, "BEVEL")
+        mod.affect = "VERTICES"
+        mod.limit_method = "WEIGHT"
+        mod.offset_type = "OFFSET"
+        mod.show_expanded = False
     mod.width = width
     mod.segments = max(1, int(segments))
-    mod.show_expanded = False
     return mod
 
 
@@ -276,6 +320,17 @@ def ellipse_curve(name: str, w: float, h: float, resolution: int = ELLIPSE_RESOL
     sp = cu.splines.new("BEZIER")
     sp.bezier_points.add(3)
     sp.use_cyclic_u = True
+    set_ellipse_points(cu, w, h)
+    return cu
+
+
+def is_ellipse_curve(cu: "bpy.types.Curve") -> bool:
+    return len(cu.splines) == 1 and cu.splines[0].type == "BEZIER" and len(cu.splines[0].bezier_points) == 4
+
+
+def set_ellipse_points(cu: "bpy.types.Curve", w: float, h: float) -> None:
+    """Resize an :func:`ellipse_curve` in place through its four control points."""
+    sp = cu.splines[0]
     rx, ry = w / 2.0, h / 2.0
     kx, ky = rx * BEZIER_CIRCLE_K, ry * BEZIER_CIRCLE_K
     # counter-clockwise: right, top, left, bottom; (co, handle_left, handle_right)
@@ -291,7 +346,32 @@ def ellipse_curve(name: str, w: float, h: float, resolution: int = ELLIPSE_RESOL
         bp.handle_left = (hl[0], hl[1], 0.0)
         bp.handle_right = (hr[0], hr[1], 0.0)
         bp.handle_left_type = bp.handle_right_type = "ALIGNED"
-    return cu
+
+
+def file_hash(path: str) -> str:
+    """Short content hash of an asset file (detects changed icons / images on re-sync)."""
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def font_key(font: Optional["bpy.types.VectorFont"]) -> str:
+    """Identify the font on a text curve; the built-in default font is ``""``."""
+    if font is None or font.filepath in ("", "<builtin>"):
+        return ""
+    return font.filepath
+
+
+def legacy_elem_id(ob: "bpy.types.Object") -> Optional[str]:
+    """Element id of an object imported before ``figma_elem_id`` existed (v0.2)."""
+    fid = ob.get("figma_id")
+    if not fid or ob.get("figma_kind") == "icon_curve":
+        return None
+    if ob.get("figma_kind") == "rect" and " (background)" in ob.name:
+        return fid + ":bg"
+    return fid
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +447,13 @@ def world_bbox(objs: List["bpy.types.Object"]) -> Optional[Tuple[Vector, Vector]
 
 # ---------------------------------------------------------------------------
 # Builder
+#
+# Every ``build_*`` method takes an optional existing object (found by element
+# id in the target collection) and then works as an *update*: it moves the
+# vertices / control points / text properties of the datablock it already has
+# and leaves everything else (extra modifiers, user materials, custom
+# properties) alone.  Without an existing object it creates one, so creation
+# and re-sync share one code path.
 # ---------------------------------------------------------------------------
 
 
@@ -378,6 +465,8 @@ class SceneBuilder:
         self.report = BuildReport()
         self.materials = MaterialCache()
         self.objects: Dict[str, "bpy.types.Object"] = {}
+        self.existing: Dict[str, "bpy.types.Object"] = {}  # element id -> object of an earlier import
+        self._removed_coll: Optional["bpy.types.Collection"] = None
         self._svg_px_to_m: Optional[float] = None
         self._text_baseline_ratio: Optional[float] = None
         self._font_cache: Dict[Tuple, Optional["bpy.types.VectorFont"]] = {}
@@ -415,12 +504,40 @@ class SceneBuilder:
     def _new_object(self, el: Element, name: str, data) -> "bpy.types.Object":
         ob = bpy.data.objects.new(name, data)
         self.report.collection.objects.link(ob)
+        self._tag(ob, el)
+        self.report.sync["created"] += 1
+        self.report.objects.append(ob)
+        return ob
+
+    @staticmethod
+    def _tag(ob: "bpy.types.Object", el: Element) -> None:
         ob["figma_id"] = el.id.split("#", 1)[0].split(":bg", 1)[0]
+        ob[ELEM_ID_PROP] = el.id
         ob["figma_type"] = el.figma_type
         ob["figma_name"] = el.name
         ob["figma_kind"] = el.kind
+
+    def _reuse(self, ob: Optional["bpy.types.Object"], el: Element, ob_type: str) -> Optional["bpy.types.Object"]:
+        """Return ``ob`` when it can be updated into ``el`` (same object type), else retire it."""
+        if ob is None:
+            return None
+        if ob.type != ob_type:
+            self._retire(ob)
+            return None
+        if ob.name == ob.get("figma_name") and el.name != ob.name:
+            ob.name = el.name  # follow a Figma rename unless the user renamed the object
+        self._tag(ob, el)
+        self.report.sync["updated"] += 1
         self.report.objects.append(ob)
+        if ob.name not in self.report.collection.objects:
+            self.report.collection.objects.link(ob)
         return ob
+
+    def _place(self, ob: "bpy.types.Object", matrix: Matrix) -> None:
+        """Set the world matrix from Figma; parenting is (re)applied by :meth:`build`."""
+        ob.parent = None
+        ob.matrix_parent_inverse = Matrix.Identity(4)
+        ob.matrix_world = matrix
 
     def _parent(self, ob: "bpy.types.Object", el: Element) -> None:
         parent = self.objects.get(el.parent) if el.parent else None
@@ -428,6 +545,47 @@ class SceneBuilder:
             return
         ob.parent = parent
         ob.matrix_parent_inverse = parent.matrix_world.inverted()
+
+    @staticmethod
+    def _apply_material(data, mat: "bpy.types.Material") -> None:
+        """Assign ``mat`` to slot 0 unless the user replaced the importer's material there."""
+        slots = data.materials
+        if len(slots) == 0:
+            slots.append(mat)
+        elif slots[0] is None or is_managed_material(slots[0]):
+            if slots[0] is not mat:
+                slots[0] = mat
+
+    def _icon_curves(self, empty: "bpy.types.Object") -> List["bpy.types.Object"]:
+        return [o for o in bpy.data.objects if o.parent == empty and o.get("figma_kind") == "icon_curve"]
+
+    def _removed_collection(self) -> "bpy.types.Collection":
+        if self._removed_coll is None:
+            name = self.report.collection.name + REMOVED_SUFFIX
+            coll = next((c for c in self.report.collection.children if c.name.startswith(name)), None)
+            if coll is None:
+                coll = bpy.data.collections.new(name)
+                self.report.collection.children.link(coll)
+            self._removed_coll = coll
+        return self._removed_coll
+
+    def _retire(self, ob: "bpy.types.Object") -> None:
+        """An element vanished from Figma: delete its object or park it in the removed collection."""
+        for o in [ob] + self._icon_curves(ob):
+            if self.opt.remove_missing:
+                data = o.data
+                bpy.data.objects.remove(o)
+                if data is not None and data.users == 0:
+                    for store in (bpy.data.meshes, bpy.data.curves):
+                        if data.name in store and store[data.name] == data:
+                            store.remove(data)
+                            break
+            else:
+                removed = self._removed_collection()
+                for c in list(o.users_collection):
+                    c.objects.unlink(o)
+                removed.objects.link(o)
+        self.report.sync["removed" if self.opt.remove_missing else "moved"] += 1
 
     def _asset_path(self, el: Element) -> Optional[str]:
         if not el.asset:
@@ -440,55 +598,94 @@ class SceneBuilder:
 
     # -- element builders ---------------------------------------------------
 
-    def build_group(self, el: Element, depth: int) -> "bpy.types.Object":
-        ob = self._new_object(el, el.name, None)
-        ob.empty_display_type = "PLAIN_AXES"
+    def build_group(self, el: Element, depth: int, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
+        if ob is None:
+            ob = self._new_object(el, el.name, None)
+            ob.empty_display_type = "PLAIN_AXES"
         ob.empty_display_size = max(0.01, min(el.w, el.h) * self.opt.scale * 0.25)
-        ob.matrix_world = self.matrix_for(el, depth, (0.0, 0.0))
+        self._place(ob, self.matrix_for(el, depth, (0.0, 0.0)))
         return ob
 
-    def _rect_object(self, el: Element, radii: Optional[List[float]], always_modifier: bool) -> "bpy.types.Object":
-        """Plane object at the element's size (object scale 1) plus a Corner Radius Bevel modifier."""
+    def _rect_object(
+        self, el: Element, radii: Optional[List[float]], always_modifier: bool, ob: Optional["bpy.types.Object"] = None
+    ) -> "bpy.types.Object":
+        """Plane object at the element's size (object scale 1) plus a Corner Radius Bevel modifier.
+
+        On update the four vertices are moved; the mesh datablock, its material
+        slots and every modifier stay.  A mesh the user edited into something
+        else is replaced by a fresh plane (materials carried over).
+        """
         s = self.opt.scale
         w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
-        mesh = plane_mesh(el.name, w, h)
-        ob = self._new_object(el, el.name, mesh)
+        if ob is None:
+            ob = self._new_object(el, el.name, plane_mesh(el.name, w, h))
+        elif is_plane_mesh(ob.data):
+            set_plane_geometry(ob.data, w, h)
+        else:
+            self.report.warnings.append("Mesh of %r was edited; replaced by a fresh plane" % ob.name)
+            old = ob.data
+            ob.data = plane_mesh(el.name, w, h)
+            for m in old.materials:
+                ob.data.materials.append(m)
         scaled = [r * s for r in radii] if radii else None
-        if scaled or always_modifier:
+        if scaled or always_modifier or ob.modifiers.get(CORNER_MODIFIER_NAME) is not None:
             add_corner_radius_modifier(ob, w, h, scaled, self.opt.corner_segments)
         return ob
 
-    def build_shape(self, el: Element, depth: int) -> "bpy.types.Object":
+    def build_shape(self, el: Element, depth: int, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
         s = self.opt.scale
         w, h = max(el.w, 1e-6) * s, max(el.h, 1e-6) * s
         if el.kind == "ellipse":
-            data = ellipse_curve(el.name, w, h)
-            ob = self._new_object(el, el.name, data)
+            if ob is None:
+                ob = self._new_object(el, el.name, ellipse_curve(el.name, w, h))
+            elif is_ellipse_curve(ob.data):
+                set_ellipse_points(ob.data, w, h)
+            else:
+                self.report.warnings.append("Curve of %r was edited; replaced by a fresh ellipse" % ob.name)
+                old = ob.data
+                ob.data = ellipse_curve(el.name, w, h)
+                for m in old.materials:
+                    ob.data.materials.append(m)
         else:
             # rect (or an icon / image falling back to its solid fill): always carry
             # the modifier so a radius can be added later without touching the mesh
-            ob = self._rect_object(el, el.corner_radii, always_modifier=True)
-            data = ob.data
+            ob = self._rect_object(el, el.corner_radii, True, ob)
         color = el.fill or [0.5, 0.5, 0.5, 1.0]
         alpha = color[3] * el.opacity if len(color) > 3 else el.opacity
-        data.materials.append(self.materials.flat(color, alpha))
+        self._apply_material(ob.data, self.materials.flat(color, alpha))
         if el.fill_approx:
             ob["figma_fill_approx"] = True
-        ob.matrix_world = self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0))
+        elif "figma_fill_approx" in ob:
+            del ob["figma_fill_approx"]
+        self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
         return ob
 
-    def build_plane(self, el: Element, depth: int, path: str) -> "bpy.types.Object":
+    @staticmethod
+    def _current_image(data) -> Optional["bpy.types.Image"]:
+        """The image shown by the importer's material in slot 0, if any."""
+        if not data.materials or not is_managed_material(data.materials[0]) or not data.materials[0].node_tree:
+            return None
+        for node in data.materials[0].node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image is not None:
+                return node.image
+        return None
+
+    def build_plane(self, el: Element, depth: int, path: str, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
         # plain textured quad; image fills with corner radii get the same Bevel modifier
         radii = el.corner_radii if (el.kind == "image" and el.corner_radii) else None
-        ob = self._rect_object(el, radii, always_modifier=False)
+        ob = self._rect_object(el, radii, always_modifier=False, ob=ob)
         mesh = ob.data
+        digest = file_hash(path)
+        image = self._current_image(mesh) if ob.get("figma_asset_hash") == digest else None
         try:
-            image = bpy.data.images.load(path, check_existing=True)
-            mesh.materials.append(self.materials.image(image, el.opacity))
+            if image is None:
+                image = bpy.data.images.load(path, check_existing=True)
+            self._apply_material(mesh, self.materials.image(image, el.opacity))
+            ob["figma_asset_hash"] = digest
         except RuntimeError as e:
             self.report.warnings.append("Could not load image %s for %r: %s" % (path, el.name, e))
-            mesh.materials.append(self.materials.flat(el.fill or [0.5, 0.5, 0.5, 1.0], el.opacity))
-        ob.matrix_world = self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0))
+            self._apply_material(mesh, self.materials.flat(el.fill or [0.5, 0.5, 0.5, 1.0], el.opacity))
+        self._place(ob, self.matrix_for(el, depth, (el.w / 2.0, el.h / 2.0)))
         return ob
 
     # SVG icons ------------------------------------------------------------
@@ -529,13 +726,9 @@ class SceneBuilder:
             pass
         return self._svg_px_to_m
 
-    def build_svg_icon(self, el: Element, depth: int, path: str) -> "bpy.types.Object":
-        objs, colls = _import_svg(path)
-        empty = self._new_object(el, el.name, None)
-        empty.empty_display_type = "PLAIN_AXES"
-        empty.empty_display_size = max(0.005, min(el.w, el.h) * self.opt.scale * 0.5)
+    def _svg_fit(self, el: Element, path: str, objs: List["bpy.types.Object"]) -> Matrix:
+        """Matrix scaling the freshly imported SVG curves to the node size (SVG top-left at the origin)."""
         s = self.opt.scale
-
         k = self._svg_scale_probe() or 0.0
         doc = svg_document_size(path)
         bb = world_bbox(objs)
@@ -544,32 +737,59 @@ class SceneBuilder:
             # exact: SVG (0,0) is the node's top-left, importer puts it at (0, doc_h * k)
             doc_w, doc_h = doc
             factor = target_w / (doc_w * k) if doc_w > 0 else target_h / (doc_h * k)
-            fit = Matrix.Scale(factor, 4) @ Matrix.Translation((0.0, -doc_h * k, 0.0))
-        elif bb is not None:
+            return Matrix.Scale(factor, 4) @ Matrix.Translation((0.0, -doc_h * k, 0.0))
+        if bb is not None:
             bw, bh = bb[1].x - bb[0].x, bb[1].y - bb[0].y
             factor = target_w / bw if bw > 1e-12 else (target_h / bh if bh > 1e-12 else 1.0)
-            fit = Matrix.Scale(factor, 4) @ Matrix.Translation((-bb[0].x, -bb[1].y, 0.0))
             self.report.warnings.append("Icon %r: SVG has no viewBox, fitted by bounding box" % el.name)
+            return Matrix.Scale(factor, 4) @ Matrix.Translation((-bb[0].x, -bb[1].y, 0.0))
+        self.report.warnings.append("Icon %r: SVG produced no geometry" % el.name)
+        return Matrix.Identity(4)
+
+    def build_svg_icon(self, el: Element, depth: int, path: str, empty: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
+        """Empty sized to the node with the SVG importer's curves as children.
+
+        The curves are generated, so on update they are re-imported when the SVG
+        changed (content hash) and kept as they are otherwise; the Empty itself
+        (and anything the user hung on it) always survives.
+        """
+        digest = file_hash(path)
+        if empty is None:
+            empty = self._new_object(el, el.name, None)
+            empty.empty_display_type = "PLAIN_AXES"
+        empty.empty_display_size = max(0.005, min(el.w, el.h) * self.opt.scale * 0.5)
+
+        old_curves = self._icon_curves(empty)
+        fit_prop = empty.get("figma_icon_fit")
+        if old_curves and empty.get("figma_asset_hash") == digest and fit_prop is not None and len(fit_prop) == 16:
+            fit = Matrix([tuple(fit_prop[i * 4 : i * 4 + 4]) for i in range(4)])
+            self.report.objects.extend(old_curves)
         else:
-            fit = Matrix.Identity(4)
-            self.report.warnings.append("Icon %r: SVG produced no geometry" % el.name)
+            for o in old_curves:
+                data = o.data
+                bpy.data.objects.remove(o)
+                if data is not None and data.users == 0:
+                    bpy.data.curves.remove(data)
+            objs, colls = _import_svg(path)
+            fit = self._svg_fit(el, path, objs)
+            for i, ob in enumerate(objs):
+                ob.name = "%s.%d" % (el.name, i) if len(objs) > 1 else "%s.curve" % el.name
+                for c in list(ob.users_collection):
+                    c.objects.unlink(ob)
+                self.report.collection.objects.link(ob)
+                ob.parent = empty
+                ob.matrix_parent_inverse = Matrix.Identity(4)
+                ob["figma_id"] = empty["figma_id"]
+                ob["figma_type"] = el.figma_type
+                ob["figma_kind"] = "icon_curve"
+                self.report.objects.append(ob)
+            for c in colls:
+                if not c.objects and not c.children:
+                    bpy.data.collections.remove(c)
+            empty["figma_asset_hash"] = digest
+            empty["figma_icon_fit"] = [v for row in fit for v in row]
 
-        empty.matrix_world = self.matrix_for(el, depth, (0.0, 0.0)) @ fit
-
-        for i, ob in enumerate(objs):
-            ob.name = "%s.%d" % (el.name, i) if len(objs) > 1 else "%s.curve" % el.name
-            for c in list(ob.users_collection):
-                c.objects.unlink(ob)
-            self.report.collection.objects.link(ob)
-            ob.parent = empty
-            ob.matrix_parent_inverse = Matrix.Identity(4)
-            ob["figma_id"] = empty["figma_id"]
-            ob["figma_type"] = el.figma_type
-            ob["figma_kind"] = "icon_curve"
-            self.report.objects.append(ob)
-        for c in colls:
-            if not c.objects and not c.children:
-                bpy.data.collections.remove(c)
+        self._place(empty, self.matrix_for(el, depth, (0.0, 0.0)) @ fit)
         return empty
 
     # Text -----------------------------------------------------------------
@@ -618,11 +838,13 @@ class SceneBuilder:
         self._font_cache[key] = font
         return font
 
-    def build_text(self, el: Element, depth: int) -> "bpy.types.Object":
+    def build_text(self, el: Element, depth: int, ob: Optional["bpy.types.Object"] = None) -> "bpy.types.Object":
         info = el.text or {}
         s = self.opt.scale
         fs = float(info.get("fontSize") or 12.0)
-        cu = bpy.data.curves.new(el.name, "FONT")
+        if ob is None:
+            ob = self._new_object(el, el.name, bpy.data.curves.new(el.name, "FONT"))
+        cu = ob.data
         body = info.get("characters", "")
         case = info.get("textCase")
         if case == "UPPER":
@@ -643,9 +865,9 @@ class SceneBuilder:
             cu.space_line = float(lh) / fs
         else:
             lh = fs * 1.2
+            cu.space_line = 1.0
         ls = info.get("letterSpacing")
-        if ls:
-            cu.space_character = max(0.1, 1.0 + float(ls) / (fs * 0.5))
+        cu.space_character = max(0.1, 1.0 + float(ls) / (fs * 0.5)) if ls else 1.0
 
         auto = info.get("textAutoResize", "NONE")
         tb = cu.text_boxes[0]
@@ -657,35 +879,63 @@ class SceneBuilder:
             tb.width = el.w * s
         tb.height = max(el.h * s, 1e-6)
 
+        # Font: assign the auto-matched font unless the user picked another one since the last import
+        # (``figma_font_file`` remembers what the importer assigned; "" is Blender's built-in font).
         font = self._load_font(info)
-        if font is not None:
-            cu.font = font
-        else:
+        previous = ob.get("figma_font_file")
+        if previous is None or previous == font_key(cu.font):
+            if font is not None:
+                cu.font = font
+            ob["figma_font_file"] = font_key(cu.font)
+        if font is None:
             fam = info.get("fontFamily") or "?"
             if fam not in self.report.missing_fonts:
                 self.report.missing_fonts.append(fam)
-
-        ob = self._new_object(el, el.name, cu)
-        if font is None:
-            ob["figma_font"] = info.get("fontFamily") or ""
-            ob["figma_font_postscript"] = info.get("fontPostScriptName") or ""
+        ob["figma_font"] = info.get("fontFamily") or ""
+        ob["figma_font_postscript"] = info.get("fontPostScriptName") or ""
         color = el.fill or [0.0, 0.0, 0.0, 1.0]
         alpha = color[3] * el.opacity if len(color) > 3 else el.opacity
-        cu.materials.append(self.materials.flat(color, alpha))
+        self._apply_material(cu, self.materials.flat(color, alpha))
 
         # Vertical placement: put Blender's first baseline where Figma's is.
         blender_baseline = self._text_probe() * cu.size  # relative to object origin, y up
         figma_baseline = -((float(lh) - fs) / 2.0 + TEXT_ASCENT_RATIO * fs) * s  # from box top, y up
         dy = figma_baseline - blender_baseline
-        ob.matrix_world = self.matrix_for(el, depth, (anchor_x, 0.0)) @ Matrix.Translation((0.0, dy, 0.0))
+        self._place(ob, self.matrix_for(el, depth, (anchor_x, 0.0)) @ Matrix.Translation((0.0, dy, 0.0)))
         return ob
 
     # -- driver ---------------------------------------------------------------
 
+    def _find_collection(self, name: str) -> Optional["bpy.types.Collection"]:
+        """An earlier import of the same root (page / frame) in this scene, matched by name and ``figma_page_id``."""
+        if not self.opt.update_existing:
+            return None
+        in_scene = set(bpy.context.scene.collection.children_recursive)
+        candidates = [
+            c
+            for c in in_scene
+            if c.get("figma_page_id") == self.scene.page_id
+            and (c.name == name or c.name.rsplit(".", 1)[0] == name)
+            and not c.name.endswith(REMOVED_SUFFIX)
+            and (not self.scene.file_key or not c.get("figma_file_key") or c.get("figma_file_key") == self.scene.file_key)
+        ]
+        candidates.sort(key=lambda c: (c.name != name, c.name))
+        return candidates[0] if candidates else None
+
+    def _index_existing(self, coll: "bpy.types.Collection") -> None:
+        for ob in coll.objects:
+            eid = ob.get(ELEM_ID_PROP) or legacy_elem_id(ob)
+            if eid and eid not in self.existing:
+                self.existing[eid] = ob
+
     def build(self) -> BuildReport:
         name = self.opt.collection_name or self.scene.page_name or "Figma Page"
-        coll = bpy.data.collections.new(name)
-        bpy.context.scene.collection.children.link(coll)
+        coll = self._find_collection(name)
+        if coll is None:
+            coll = bpy.data.collections.new(name)
+            bpy.context.scene.collection.children.link(coll)
+        else:
+            self._index_existing(coll)
         coll["figma_page_id"] = self.scene.page_id
         coll["figma_file_key"] = self.scene.file_key
         self.report.collection = coll
@@ -696,8 +946,9 @@ class SceneBuilder:
             self.report.warnings.append("SVG importer (import_curve.svg) not available; icons imported as planes")
 
         for depth, el in enumerate(self.scene.elements):
+            existing = self.existing.pop(el.id, None)
             try:
-                ob = self._build_element(el, depth, svg_ok)
+                ob = self._build_element(el, depth, svg_ok, existing)
             except Exception as e:  # noqa: BLE001 - keep going, report the failure
                 log.exception("Failed to build %s", el.id)
                 self.report.warnings.append("Failed to build %r (%s): %s" % (el.name, el.kind, e))
@@ -707,27 +958,37 @@ class SceneBuilder:
             self.objects[el.id] = ob
             self._parent(ob, el)
             self.report.bump(el.kind)
+
+        for ob in list(self.existing.values()):  # elements that vanished from Figma
+            self._retire(ob)
+        self.existing.clear()
         return self.report
 
-    def _build_element(self, el: Element, depth: int, svg_ok: bool) -> Optional["bpy.types.Object"]:
+    def _build_element(
+        self, el: Element, depth: int, svg_ok: bool, existing: Optional["bpy.types.Object"] = None
+    ) -> Optional["bpy.types.Object"]:
         if el.kind == "group":
-            return self.build_group(el, depth)
-        if el.kind in ("rect", "ellipse"):
-            return self.build_shape(el, depth)
+            return self.build_group(el, depth, self._reuse(existing, el, "EMPTY"))
+        if el.kind == "rect":
+            return self.build_shape(el, depth, self._reuse(existing, el, "MESH"))
+        if el.kind == "ellipse":
+            return self.build_shape(el, depth, self._reuse(existing, el, "CURVE"))
         if el.kind == "text":
-            return self.build_text(el, depth)
+            return self.build_text(el, depth, self._reuse(existing, el, "FONT"))
         if el.kind in ("image", "icon"):
             path = self._asset_path(el)
             if path is None:
                 if el.fill:
                     self.report.warnings.append("No asset for %r; using its solid fill" % el.name)
-                    return self.build_shape(el, depth)
+                    return self.build_shape(el, depth, self._reuse(existing, el, "MESH"))
                 self.report.warnings.append("No asset for %r; skipped" % el.name)
+                if existing is not None:
+                    self._retire(existing)
                 return None
             is_svg = path.lower().endswith(".svg")
             if el.kind == "icon" and is_svg and self.opt.icon_mode == "SVG" and svg_ok:
                 try:
-                    return self.build_svg_icon(el, depth, path)
+                    return self.build_svg_icon(el, depth, path, self._reuse(existing, el, "EMPTY"))
                 except Exception as e:  # noqa: BLE001
                     self.report.warnings.append("SVG import failed for %r (%s)" % (el.name, e))
                     if el.fill:
@@ -738,14 +999,22 @@ class SceneBuilder:
                 self.report.warnings.append(
                     "Icon %r is an SVG but icon mode is PLANE; re-export the bundle with icon format PNG. Using solid fill." % el.name
                 )
-                return self.build_shape(el, depth) if el.fill else None
-            return self.build_plane(el, depth, path)
+                if el.fill:
+                    return self.build_shape(el, depth, self._reuse(existing, el, "MESH"))
+                if existing is not None:
+                    self._retire(existing)
+                return None
+            return self.build_plane(el, depth, path, self._reuse(existing, el, "MESH"))
         self.report.warnings.append("Unknown element kind %r for %r" % (el.kind, el.name))
         return None
 
 
 def build_scene(scene: Scene, bundle_dir: str, options: Optional[BuildOptions] = None) -> BuildReport:
-    """Build ``scene`` into the current Blender scene and return a report."""
+    """Build ``scene`` into the current Blender scene and return a report.
+
+    With ``options.update_existing`` (default) an earlier import of the same
+    page / frame in this scene is updated in place instead of duplicated.
+    """
     return SceneBuilder(scene, bundle_dir, options).build()
 
 

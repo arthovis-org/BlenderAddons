@@ -148,6 +148,19 @@ if bpy is not None:
             default="XZ",
         )
         center: BoolProperty(name="Center at origin", description="Move the page's centre to the world origin", default=True)
+        update_existing: BoolProperty(
+            name="Update existing objects",
+            description="Re-import into the collection of an earlier import of the same page/frame: objects are matched by "
+            "Figma id and updated in place (transform, size, text, importer materials) while your extra modifiers, "
+            "swapped materials and custom properties are kept. Off: always build a fresh collection",
+            default=True,
+        )
+        remove_missing: BoolProperty(
+            name="Delete removed elements",
+            description="When updating, delete objects whose Figma element no longer exists instead of moving them "
+            "into the '<collection> (removed)' sub-collection",
+            default=False,
+        )
         bundle_dir: StringProperty(name="Bundle folder", description="Folder containing scene.json and assets/", subtype="DIR_PATH")
         export_dir: StringProperty(name="Export to", description="Folder to write the bundle into", subtype="DIR_PATH")
 
@@ -159,6 +172,8 @@ if bpy is not None:
             plane_orientation=s.orientation,
             center=s.center,
             corner_segments=s.corner_segments,
+            update_existing=s.update_existing,
+            remove_missing=s.remove_missing,
         )
 
     def export_options(s: "FIGMA_settings") -> scene_model.ExportOptions:
@@ -367,6 +382,10 @@ if bpy is not None:
             col.prop(s, "icon_max_size")
             col.prop(s, "raster_scale")
             box.prop(s, "center")
+            box.prop(s, "update_existing")
+            sub = box.row()
+            sub.active = s.update_existing
+            sub.prop(s, "remove_missing")
             layout.operator(FIGMA_OT_import_page.bl_idname, icon="IMPORT")
 
             box = layout.box()
