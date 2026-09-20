@@ -20,9 +20,9 @@ python tools/build_zip.py --addon figma_to_blender   # -> dist/figma_to_blender.
 python tools/build_zip.py                            # every add-on in the repo
 ```
 
-**Blender 4.2+ (extension):** drag the zip into Blender, or *Edit ▸ Preferences ▸ Get Extensions ▸
-⌄ ▸ Install from Disk*. **Blender 3.6 - 4.1:** *Edit ▸ Preferences ▸ Add-ons ▸ Install…* with the
-same zip. Each add-on's README has the details.
+All add-ons target **Blender 5.0 or newer** (they are packaged as extensions and are not tested
+on older versions). Drag the zip into the Blender window, or *Edit ▸ Preferences ▸ Get Extensions ▸
+⌄ ▸ Install from Disk*. Each add-on's README has the details.
 
 ## Layout
 
@@ -37,8 +37,8 @@ tools/build_zip.py        zips every add-on folder into dist/
 
 ## Adding an add-on
 
-1. Create `<name>/` with a `blender_manifest.toml` (Blender 4.2+) and/or an `__init__.py`
-   declaring `bl_info`; `tools/build_zip.py` picks it up automatically.
+1. Create `<name>/` with a `blender_manifest.toml` (`blender_version_min = "5.0.0"`);
+   `tools/build_zip.py` picks it up automatically.
 2. Put its tests in `<name>/tests/` so `python -m unittest discover -s <name>/tests -t .` works
    from the repo root, and add `<name>` to the `addon` matrix in
    `.github/workflows/build-addon.yml`.

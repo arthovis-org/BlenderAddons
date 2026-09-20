@@ -23,12 +23,14 @@ To build it locally (standard library only, from the repo root):
 python tools/build_zip.py --addon figma_to_blender   # -> ./dist/figma_to_blender.zip
 ```
 
-**Blender 4.2+ (extension):** drag the zip into Blender, or use
-*Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk*. The zip contains the
-`figma_to_blender/` folder with `blender_manifest.toml` inside it.
+**Requires Blender 5.0 or newer.** The add-on is a Blender extension: drag the zip into the
+Blender window, or use *Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk*. The zip
+contains the `figma_to_blender/` folder with `blender_manifest.toml` inside it. Older Blender
+versions are not supported.
 
-**Blender 3.6 - 4.1 (legacy add-on):** *Edit ▸ Preferences ▸ Add-ons ▸ Install…* with the same
-zip, then enable *Import-Export: Figma to Blender*.
+*SVG curves* icon mode uses Blender's bundled SVG importer (`bpy.ops.import_curve.svg`, part of
+Blender 5.0 and of the `bpy` 5.0 wheel); if a custom build lacks it, icons fall back to planes
+with a warning.
 
 ## Get a Figma token
 
@@ -170,7 +172,7 @@ other add-ons in [arthovis-org/BlenderAddons](../README.md)):
 
 ```sh
 python -m unittest discover -s figma_to_blender/tests -t .   # pure-python tests (fixture in tests/fixtures), also run in CI
-pip install bpy && python -m pytest figma_to_blender/tests/  # also runs the builder tests (Python 3.11)
+pip install bpy && python -m pytest figma_to_blender/tests/  # also runs the builder tests (bpy 5.0 wheel, Python 3.11)
 FIGMA_RENDER_OUT=render.png python -m pytest figma_to_blender/tests/test_builder_bpy.py -k render
 python tools/build_zip.py --addon figma_to_blender          # the same zip CI uploads
 ```

@@ -9,9 +9,8 @@ Standard library only. Run from anywhere::
 
 An *add-on* is any top-level folder that contains a ``blender_manifest.toml``
 or an ``__init__.py`` declaring ``bl_info``. Each archive contains the folder
-itself (with ``blender_manifest.toml`` inside it), which is what both *Install
-from Disk* (Blender 4.2+ extensions) and the legacy *Add-ons > Install...*
-expect. ``__pycache__``, ``tests/`` and ``docs/`` folders, ``.pyc`` files and
+itself (with ``blender_manifest.toml`` inside it), which is what Blender 5's
+*Get Extensions > Install from Disk* (or dropping the zip into the window) expects. ``__pycache__``, ``tests/`` and ``docs/`` folders, ``.pyc`` files and
 ``README.md`` at the add-on root are skipped: they are for the repo, not the
 installed add-on.
 """

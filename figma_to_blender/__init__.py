@@ -9,7 +9,7 @@ bl_info = {
     "name": "Figma to Blender",
     "author": "arthovis-org",
     "version": (0, 1, 0),
-    "blender": (3, 6, 0),
+    "blender": (5, 0, 0),
     "location": "3D Viewport > Sidebar (N) > Figma",
     "description": "Import a Figma page as editable 3D UI: text, rounded shapes, icons (SVG curves or planes) and images",
     "doc_url": "https://github.com/arthovis-org/BlenderAddons",

@@ -8,7 +8,7 @@ maintainer = "arthovis-org"
 type = "add-on"
 website = "https://github.com/arthovis-org/BlenderAddons"
 tags = ["Import-Export", "User Interface"]
-blender_version_min = "4.2.0"
+blender_version_min = "5.0.0"
 license = ["SPDX:MIT"]
 
 [permissions]

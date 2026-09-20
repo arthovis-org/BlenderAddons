@@ -1,6 +1,6 @@
 """Builder tests. They run only when ``bpy`` is importable (Blender or the ``bpy`` wheel).
 
-    pip install bpy   # Python 3.11 for Blender 4.x wheels
+    pip install bpy   # Python 3.11 for the Blender 5.x bpy wheel
     python -m pytest figma_to_blender/tests/test_builder_bpy.py -q
 
 Set ``FIGMA_RENDER_OUT=/path/render.png`` to also write a headless render of the
@@ -227,10 +227,8 @@ class BuilderTests(unittest.TestCase):
         avatar = self._by_name(report, "Avatar bg")
         amat = avatar.data.materials[0]
         self.assertAlmostEqual(amat.diffuse_color[3], 0.9, places=3)
-        if hasattr(amat, "blend_method"):
-            self.assertEqual(amat.blend_method, "BLEND")
-        if hasattr(amat, "surface_render_method"):
-            self.assertEqual(amat.surface_render_method, "BLENDED")
+        self.assertEqual(amat.surface_render_method, "BLENDED")
+        self.assertFalse(amat.show_transparent_back)
         # materials are shared by colour
         label = self._by_name(report, "Label")  # white text shares the white card material
         self.assertIs(label.data.materials[0], bg.data.materials[0])

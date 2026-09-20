@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 CORNER_SEGMENTS = 8  # default Bevel modifier segments per rounded corner
 ELLIPSE_RESOLUTION = 24  # curve resolution_u (points per Bezier segment) for ellipses
 CORNER_MODIFIER_NAME = "Corner Radius"
-BEVEL_WEIGHT_ATTR = "bevel_weight_vert"  # Blender 4.x+ stores vertex bevel weights here
+BEVEL_WEIGHT_ATTR = "bevel_weight_vert"  # mesh attribute holding per-vertex bevel weights
 BEZIER_CIRCLE_K = 0.5522847498  # handle length / radius for a 4-point Bezier circle
 TEXT_ASCENT_RATIO = 0.8  # approximate ascender / font size used to place Figma baselines
 
@@ -87,30 +87,16 @@ class BuildReport:
 
 
 def set_material_blend(mat: "bpy.types.Material", alpha: float) -> None:
-    """Enable alpha blending, guarding attributes that differ across versions."""
+    """Enable EEVEE alpha blending for a translucent fill (Blender 5.0 ``surface_render_method``)."""
     if alpha >= 0.999:
         return
-    if hasattr(mat, "blend_method"):
-        try:
-            mat.blend_method = "BLEND"
-        except TypeError:
-            pass
-    if hasattr(mat, "surface_render_method"):  # 4.2+
-        mat.surface_render_method = "BLENDED"
-    if hasattr(mat, "shadow_method"):  # <= 4.1
-        try:
-            mat.shadow_method = "HASHED"
-        except TypeError:
-            pass
-    if hasattr(mat, "show_transparent_back"):
-        mat.show_transparent_back = False
+    mat.surface_render_method = "BLENDED"
+    mat.show_transparent_back = False
 
 
 def _emission_output(mat: "bpy.types.Material"):
     """Reset the node tree to Emission -> Output and return (nodes, links, emission, output)."""
-    if hasattr(mat, "use_nodes") and not mat.use_nodes:  # always on from 5.0, deprecated there
-        mat.use_nodes = True
-    nt = mat.node_tree
+    nt = mat.node_tree  # node trees are always on in Blender 5.0
     nt.nodes.clear()
     out = nt.nodes.new("ShaderNodeOutputMaterial")
     out.location = (400, 0)
@@ -223,13 +209,7 @@ def plane_mesh(name: str, w: float, h: float) -> "bpy.types.Mesh":
 
 
 def set_vertex_bevel_weights(mesh: "bpy.types.Mesh", weights: List[float]) -> None:
-    """Write per-vertex bevel weights (Blender 3.x ``MeshVertex.bevel_weight`` or the 4.x+ attribute)."""
-    if len(mesh.vertices) and hasattr(mesh.vertices[0], "bevel_weight"):  # Blender <= 3.x
-        if hasattr(mesh, "use_customdata_vertex_bevel"):
-            mesh.use_customdata_vertex_bevel = True
-        for v, wgt in zip(mesh.vertices, weights):
-            v.bevel_weight = float(wgt)
-        return
+    """Write per-vertex bevel weights into the ``bevel_weight_vert`` mesh attribute."""
     attr = mesh.attributes.get(BEVEL_WEIGHT_ATTR)
     if attr is None:
         attr = mesh.attributes.new(BEVEL_WEIGHT_ATTR, "FLOAT", "POINT")
@@ -239,8 +219,6 @@ def set_vertex_bevel_weights(mesh: "bpy.types.Mesh", weights: List[float]) -> No
 
 def vertex_bevel_weights(mesh: "bpy.types.Mesh") -> List[float]:
     """Read back what :func:`set_vertex_bevel_weights` wrote (used by tests and re-sync)."""
-    if len(mesh.vertices) and hasattr(mesh.vertices[0], "bevel_weight"):
-        return [float(v.bevel_weight) for v in mesh.vertices]
     attr = mesh.attributes.get(BEVEL_WEIGHT_ATTR)
     if attr is None:
         return [0.0] * len(mesh.vertices)
@@ -356,6 +334,7 @@ def svg_document_size(path: str) -> Optional[Tuple[float, float]]:
 
 
 def svg_importer_available() -> bool:
+    """Feature check, not a version check: the bundled SVG importer can be disabled or missing in custom builds."""
     return hasattr(bpy.ops, "import_curve") and hasattr(bpy.ops.import_curve, "svg")
 
 
@@ -599,7 +578,7 @@ class SceneBuilder:
         """Ratio (baseline y / size) Blender uses for TOP alignment inside a text box."""
         if self._text_baseline_ratio is not None:
             return self._text_baseline_ratio
-        ratio = 0.2  # measured default for Blender 3.6 - 5.0
+        ratio = 0.2  # measured default for Blender 5.0
         try:
             cu = bpy.data.curves.new("_figma_probe", "FONT")
             cu.body = "H"
