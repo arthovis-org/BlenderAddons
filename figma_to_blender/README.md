@@ -4,7 +4,9 @@ A Blender add-on that imports a **Figma page, or a single frame, as editable 3D 
 objects, rectangles become planes with a *Corner Radius* Bevel modifier, ellipses become
 filled curves, icons become SVG curves (or textured planes), image fills become textured
 planes, and Figma frames/groups become parented Empties, so you can grab a whole card or menu
-and move it in 3D. Everything is built [non-destructively](#non-destructive-by-design).
+and move it in 3D. Gradient fills become shader-node gradients and strokes become a Geometry
+Nodes outline. Everything is built [non-destructively](#non-destructive-by-design), and
+[importing again](#re-import--sync) updates what is already there instead of duplicating it.
 
 It talks to the Figma REST API directly from Blender (standard library only, no `requests`),
 and the same pure-Python core also runs as a CLI so a page can be exported once to an offline
@@ -14,7 +16,7 @@ and the same pure-Python core also runs as a CLI so a page can be exported once 
 
 ## Install
 
-Download [`figma_to_blender-v0.2.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.2.0.zip)
+Download [`figma_to_blender-v0.3.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.3.0.zip)
 from the repo's `releases/` folder. Alternatively, every push and pull request to [this repo](../README.md) runs the
 [Build add-ons](../.github/workflows/build-addon.yml) workflow, which runs the tests and uploads
 the zip as the `figma_to_blender` artifact (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
@@ -57,9 +59,13 @@ Open the 3D Viewport sidebar (`N`) ▸ **Figma** tab.
    - **Corner segments**: segments per rounded corner on the *Corner Radius* Bevel modifier
      (default 8; change it later per object in the modifier itself).
    - **Icon max size**, **Raster scale**, **Center at origin**.
+   - **Update existing objects** (on by default): importing the same page/frame again updates
+     the earlier import in place, see [Re-import / sync](#re-import--sync). **Delete removed
+     elements** deletes objects whose Figma element disappeared instead of parking them.
 4. **Import**. A new collection named after the page (or frame) appears, with one Empty per
-   Figma frame/group and children parented to it. Every object carries `figma_id`, `figma_type`,
-   `figma_name` custom properties; text whose font was not found gets `figma_font`.
+   Figma frame/group and children parented to it. Every object carries `figma_id`,
+   `figma_elem_id`, `figma_type`, `figma_name` custom properties; text records its Figma font
+   family in `figma_font` (and the file the importer assigned in `figma_font_file`).
 
 **Offline bundle** box: *Export bundle to folder* fetches the same page/frame/node without
 building; *Import bundle* builds from a folder written earlier by the add-on or the CLI.
@@ -90,8 +96,45 @@ other frame. *Center at origin* still applies afterwards if you prefer the frame
 in `page_id` / `page_name` (kept for compatibility) plus `root_type` (`CANVAS` for a page,
 `FRAME`, `SECTION`, ... otherwise).
 
-The operator prints a summary (counts per kind, fonts not found, warnings) to the status bar
-and full warnings to the system console.
+The operator prints a summary (counts per kind, sync tallies, fonts not found, warnings) to the
+status bar and full warnings to the system console.
+
+## Re-import / sync
+
+Iterate in Figma and press **Import** again: with **Update existing objects** on (the default)
+the add-on looks for the collection of the earlier import (same name and the same page/frame
+id stored in `figma_page_id`) and updates its objects in place instead of creating a
+`Page 1.001` copy. Objects are matched by the `figma_elem_id` custom property (objects imported
+by v0.2 are matched through `figma_id`), so you can rename them freely.
+
+**What follows Figma** (the design is the source of truth):
+
+- position, rotation, flip, depth offset and parenting of every object;
+- a rectangle's / image plane's size: the plane's four vertices move, the mesh datablock and
+  every modifier on it stay; the *Corner Radius* modifier's width, per-corner weights and
+  segments;
+- an ellipse's size through its four control points;
+- text: body, size, alignment, line spacing, letter spacing, text box, colour; the font, unless
+  you assigned another font yourself since the last import (the importer remembers what it
+  assigned in `figma_font_file`);
+- image planes swap to the new image when the rendered asset changed (content hash);
+- SVG icons re-import their curves when the SVG changed and keep them otherwise; the parent
+  Empty always survives;
+- materials the importer created (they carry a `figma_managed` property and are shared per
+  colour / gradient) follow the new fill, gradient and stroke; the *Stroke* modifier is added,
+  updated or removed to match.
+
+**What is preserved**: modifiers you added, materials you assigned in place of the importer's,
+custom properties you set, object names you changed, the font you picked. A mesh or curve you
+edited into something else is replaced by a fresh plane / ellipse (with a warning), because
+its size can no longer be applied.
+
+**Removed elements**: objects whose Figma element no longer exists are moved into a
+`<collection> (removed)` sub-collection (SVG icon curves go with their Empty) so nothing is
+lost; with **Delete removed elements** they are deleted instead. An element whose type changed
+(a rectangle turned into an ellipse) is treated as removed + new. The report shows
+`sync: created N, updated N, moved N, removed N`. Turn **Update existing objects** off to get
+the old behaviour (always a fresh collection). *Import bundle* syncs the same way.
 
 ## CLI
 
@@ -135,13 +178,41 @@ baked into geometry, so you can keep tweaking after import:
 | Icon (SVG mode) | the importer's curve objects, untouched, under an Empty whose **object transform** scales the SVG to the node size | move / scale the Empty; the curves are the raw SVG paths |
 | Position, rotation, flip | object `matrix_world` (rotation on the object, never in the mesh) | N panel |
 | Fill colour, opacity | emission material shared per colour | material |
+| Gradient fill (linear, radial, angular, diamond) | **shader nodes**: Texture Coordinate (UV; *Generated* for ellipse curves) → Mapping (from the gradient handles) → Gradient Texture → Color Ramp (the stops, colour + alpha) → Emission; one material per gradient | Mapping node (move/rotate the gradient), Color Ramp (recolour / add stops) |
+| Stroke (`strokes[0]`, `strokeWeight`, `strokeAlign`) | **Geometry Nodes modifier** *Stroke* using the shared *Figma Stroke* node group: outlines the evaluated shape (after the bevel), Width = weight × scale, Align = INSIDE / CENTER / OUTSIDE, Material = flat stroke colour, Lift above the fill | modifier inputs (width, align, material); disable or delete it to drop the stroke |
 | Text | Blender text object (`size`, `align_x/y`, `space_line`, `space_character`, text box) | data properties |
 
 Still baked, because Blender has no parameter for it: the plane's *size* (a plane is its four
 vertices; scaling the object instead would distort the bevel), the ellipse's *size* (curve
 control points, kept editable), and the text baseline offset (a translation in the object
-matrix that compensates Blender's TOP alignment). Gradients are averaged into one colour and
-strokes/effects are not imported (see Limitations).
+matrix that compensates Blender's TOP alignment). Effects are not imported (see Limitations).
+
+### Gradients
+
+The first visible fill is used. Figma's `gradientHandlePositions` are normalised to the node
+box, so the plane's 0..1 UVs map them exactly: handle 0 is the Mapping node's location,
+handle 0 → handle 1 its rotation and scale (the 0..1 axis of the Gradient Texture), and for
+radial / diamond gradients handle 2 sets the second axis. Linear uses `LINEAR`; radial uses
+`SPHERICAL` inverted (Blender's is 1 at the centre); angular uses `RADIAL` remapped to sweep
+clockwise from handle 1; diamond is `|x| + |y|` from math nodes because Blender has no diamond
+type. Stops beyond 32 (Blender's Color Ramp limit) are dropped. Ellipses are curve objects
+without UVs, so they use *Generated* coordinates (their bound box), which is the same box as
+long as no stroke sticks out of it (an approximation for outside/centre strokes). Text keeps a
+single colour, the average of the stops (`figma_fill_approx` marks it).
+
+### Strokes
+
+Rectangles, frame backgrounds, image planes and ellipses with a visible solid `strokes[0]` and
+`strokeWeight > 0` get the *Stroke* modifier (a gradient stroke is averaged to one colour, a
+node with a stroke but no fill imports with a fully transparent fill). Inside the *Figma
+Stroke* group: Edge Neighbors = 1 selects the boundary edges → Mesh to Curve (an ellipse curve
+passes straight through) → Resample Curve (*Evaluated*) → Set Curve Normal (*Z Up*, so the
+profile lies in the shape's plane) → Set Position moves the outline by ± width / 2 for the
+alignment → Curve to Mesh sweeps a straight profile of length Width, scaled by the mitre
+factor at corners so sharp rectangles get square outer corners → Set Material → Join Geometry
+with the original shape, so the fill face stays. Strokes on text and icons are not imported
+(one warning); the *Corner Radius* bevel feeds the stroke, so rounded corners get a rounded
+outline automatically.
 
 ## How it works
 
@@ -159,7 +230,9 @@ Figma REST API ──► figma_api.py ──► scene_model.py ──► scene.j
 - Icons and image fills are rendered by `GET /v1/images/{key}` in batches of 40 with retry/backoff
   on 429; a failed render is logged and skipped, never fatal.
 - `scene.json` is a flat draw-ordered list of `text | rect | ellipse | icon | image | group`
-  elements with world transform, size, first visible fill, opacity, corner radii and text style.
+  elements with world transform, size, first visible fill (`fill`, plus `fill_gradient` with
+  type / stops / handles for a gradient), first stroke (`stroke_rgba`, `stroke_weight`,
+  `stroke_align`), opacity, corner radii and text style.
 
 ### Icon detection and SVG vs planes
 
@@ -182,12 +255,14 @@ it measures the importer's px→metre factor once, then scales each icon so the 
 matches the node size exactly (falling back to bounding-box fitting for SVGs without a
 viewBox). If the importer is unavailable, icons fall back to planes with a warning.
 
-## Limitations (v0.2)
+## Limitations (v0.3)
 
-- Gradients are approximated by a single averaged colour (`fill_approx` flag / `figma_fill_approx`
-  property); image fills on shapes other than the first fill are ignored.
-- Strokes, effects (shadows, blurs), blend modes and masks are not imported (they do survive
-  inside PNG icons/images).
+- Only the first visible fill and the first stroke of a node are used; gradient *strokes* and
+  text gradients are averaged to one colour (`fill_approx` / `figma_fill_approx`); dashed
+  strokes, per-side stroke weights (reduced to the largest side) and stroke caps/joins are
+  not imported; strokes on text and icons are skipped.
+- Effects (shadows, blurs), blend modes and masks are not imported (they do survive inside PNG
+  icons/images).
 - Fonts must be installed locally; the add-on matches by PostScript name, then family + weight.
   Otherwise Blender's default font is used and the family is recorded in `figma_font`.
 - Text vertical metrics are approximated (ascender ≈ 0.8 em); mixed styles within one text
@@ -198,11 +273,10 @@ viewBox). If the importer is unavailable, icons fall back to planes with a warni
 
 ## Roadmap
 
-- Strokes as outline curves / inset meshes, drop shadows as translucent planes.
-- Real gradients via colour-ramp shader nodes.
+- Drop shadows as translucent planes, dashed strokes.
 - Per-run text styling from `characterStyleOverrides`.
-- Extrude presets (depth per kind) and a "re-sync from Figma" operator that updates existing
-  objects by `figma_id` (the Bevel modifier / curve data make this a property update).
+- Extrude presets (depth per kind).
+- Resurrect an element from the *(removed)* collection when its id comes back.
 
 ## Development
 
@@ -219,8 +293,11 @@ python tools/build_zip.py --addon figma_to_blender          # the same zip CI up
 The bpy tests build the fixture page in both icon modes and assert object counts, types,
 positions, rotation, parenting, materials, the SVG icon's bounding box, the *Corner Radius*
 Bevel modifier (width, segments, per-corner vertex weights, evaluated vertex count), the
-ellipse curve (2D, fill BOTH, dimensions) and a single-frame import (collection named after the
-frame, background plane cornered at the origin, only the subtree built).
+ellipse curve (2D, fill BOTH, dimensions), a single-frame import (collection named after the
+frame, background plane cornered at the origin, only the subtree built), the gradient
+material node trees, the *Stroke* modifier (evaluated extents per alignment, shared node
+group) and re-import: a no-op second import, Figma edits applied in place while user
+modifiers / materials / properties survive, removed elements parked, legacy objects matched.
 
 ## License
 
