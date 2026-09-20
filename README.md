@@ -9,12 +9,12 @@ add-on (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
 
 | Add-on | What it does | Docs |
 |---|---|---|
-| [`figma_to_blender/`](figma_to_blender/) | Imports a Figma page, or a single frame of it, as editable 3D UI: text as text objects, rectangles as planes with a *Corner Radius* Bevel modifier, ellipses as filled curves, icons as SVG curves or textured planes, images as textured planes, frames/groups as parented Empties, gradients as shader nodes, strokes as a Geometry Nodes outline. Built non-destructively, so radii, sizes and transforms stay editable after import, and re-importing updates the existing objects by Figma id. Also runs as a CLI that exports an offline scene bundle. | [README](figma_to_blender/README.md) |
+| [`figma_to_blender/`](figma_to_blender/) | Imports a Figma page, or a single frame of it, as editable 3D UI: text as text objects, rectangles as planes with a *Corner Radius* Bevel modifier, ellipses as filled curves, icons as SVG curves or textured planes, images as textured planes, frames/groups as parented Empties, gradients as shader nodes, strokes as a Geometry Nodes outline. Component instances share the component's data (or become collection instances), optional 3D depth presets add Solidify / extrude without baking, fonts come from a local folder (offline). Built non-destructively, so radii, sizes and transforms stay editable after import, and re-importing updates the existing objects by Figma id. Also runs as a CLI that exports an offline scene bundle. | [README](figma_to_blender/README.md) |
 
 ## Install an add-on
 
 Download the latest zip from [`releases/`](releases/) (for example
-[`figma_to_blender-v0.3.0.zip`](releases/figma_to_blender/figma_to_blender-v0.3.0.zip)), grab
+[`figma_to_blender-v0.4.0.zip`](releases/figma_to_blender/figma_to_blender-v0.4.0.zip)), grab
 `<name>.zip` from the latest workflow run, or build it locally (standard library only):
 
 ```sh

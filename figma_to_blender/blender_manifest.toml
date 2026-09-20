@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "figma_to_blender"
-version = "0.3.0"
+version = "0.4.0"
 name = "Figma to Blender"
-tagline = "Import a Figma page or frame as editable 3D UI, re-sync it by Figma id"
+tagline = "Import a Figma page or frame as editable 3D UI: linked component instances, 3D presets, re-sync by Figma id"
 maintainer = "arthovis-org"
 type = "add-on"
 website = "https://github.com/arthovis-org/BlenderAddons"

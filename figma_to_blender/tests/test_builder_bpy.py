@@ -1144,8 +1144,18 @@ class BuilderTests(unittest.TestCase):
         from figma_to_blender import builder
 
         out = os.environ.get("FIGMA_RENDER_OUT") or os.path.join(self.tmp, "render.png")
-        scene, report, opts = self._build("SVG", center=True)
-        builder.add_preview_camera(report, opts, scene)
+        # the CARD preset from a slightly turned camera, so the Depth modifiers / extrudes show
+        scene, report, opts = self._build("SVG", center=True, depth_preset="CARD")
+        sc = bpy.context.scene
+        sc.render.resolution_x, sc.render.resolution_y = 800, 600
+        cam = builder.add_preview_camera(report, opts, scene, margin=1.25, angle=28.0, elevation=8.0)
+        self.assertEqual(cam.data.type, "PERSP")
+        self.assertLess(cam.location.y, 0.0)  # in front of the upright UI, turned to the right
+        self.assertGreater(cam.location.x, 0.0)
+        self.assertGreater(cam.location.z, 0.0)
+        ortho = builder.add_preview_camera(report, opts, scene)
+        self.assertEqual(ortho.data.type, "ORTHO")
+        bpy.context.scene.camera = cam
         sc = bpy.context.scene
         sc.render.resolution_x, sc.render.resolution_y = 800, 600
         sc.render.resolution_percentage = 100
@@ -1170,7 +1180,7 @@ class BuilderTests(unittest.TestCase):
             pass
         world = bpy.data.worlds.new("Figma World")
         sc.world = world
-        world.color = (0.85, 0.85, 0.88)
+        world.color = (0.32, 0.33, 0.36)  # darker backdrop so the light card's rim reads from the side
         rendered = False
         for engine in candidates:
             if engine != "CYCLES" and engine not in engines:

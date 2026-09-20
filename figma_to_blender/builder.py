@@ -1882,25 +1882,51 @@ def build_bundle(bundle_dir: str, options: Optional[BuildOptions] = None) -> Bui
     return build_scene(load_scene(bundle_dir), bundle_dir, options)
 
 
-def add_preview_camera(report: BuildReport, options: BuildOptions, scene: Scene, margin: float = 1.1) -> "bpy.types.Object":
-    """Add an orthographic camera framing the imported page (handy for tests / turntables)."""
+def add_preview_camera(
+    report: BuildReport, options: BuildOptions, scene: Scene, margin: float = 1.1, angle: float = 0.0, elevation: float = 0.0
+) -> "bpy.types.Object":
+    """Add a camera framing the imported page (handy for tests / turntables).
+
+    With ``angle`` / ``elevation`` at 0 it is an orthographic front view; otherwise
+    a perspective camera turned ``angle`` degrees around the page's up axis and
+    tilted ``elevation`` degrees, so depth from the 3D presets is visible.
+    """
     b = scene.bounds or {"x": 0, "y": 0, "w": 1, "h": 1}
     w, h = b["w"] * options.scale, b["h"] * options.scale
     cam_data = bpy.data.cameras.new("Figma Camera")
-    cam_data.type = "ORTHO"
-    cam_data.ortho_scale = max(w, h) * margin
     cam = bpy.data.objects.new("Figma Camera", cam_data)
     report.collection.objects.link(cam)
     if options.center:
         cx, cy = 0.0, 0.0
     else:
         cx, cy = (b["x"] + b["w"] / 2.0) * options.scale, -(b["y"] + b["h"] / 2.0) * options.scale
-    dist = 1.0 + len(scene.elements) * options.depth_step
+    depth = len(scene.elements) * options.depth_step
     if options.plane_orientation == "XY":
-        cam.location = (cx, cy, dist)
-        cam.rotation_euler = (0.0, 0.0, 0.0)
+        centre = Vector((cx, cy, 0.0))
+        base_euler = (0.0, 0.0, 0.0)  # looking down -Z from above
     else:
-        cam.location = (cx, -dist, cy)
-        cam.rotation_euler = (math.pi / 2.0, 0.0, 0.0)
+        centre = Vector((cx, 0.0, cy))
+        base_euler = (math.pi / 2.0, 0.0, 0.0)  # looking along +Y from the front
+    if not angle and not elevation:
+        cam_data.type = "ORTHO"
+        cam_data.ortho_scale = max(w, h) * margin
+        dist = 1.0 + depth
+        euler = base_euler
+    else:
+        cam_data.type = "PERSP"
+        cam_data.lens = 50.0
+        # fit both axes: ``angle`` is the field of view across the larger render dimension
+        r = bpy.context.scene.render
+        aspect = (r.resolution_x * r.pixel_aspect_x) / max(1e-6, r.resolution_y * r.pixel_aspect_y)
+        tan_h = math.tan(cam_data.angle / 2.0) * (1.0 if aspect >= 1.0 else aspect)
+        tan_v = tan_h / aspect
+        dist = max(w * margin / 2.0 / tan_h, h * margin / 2.0 / tan_v) + depth
+        euler = (base_euler[0] - math.radians(elevation), 0.0, math.radians(angle))
+    from mathutils import Euler
+
+    rot = Euler(euler, "XYZ")
+    view_dir = rot.to_matrix() @ Vector((0.0, 0.0, -1.0))
+    cam.location = centre - view_dir * dist
+    cam.rotation_euler = rot
     bpy.context.scene.camera = cam
     return cam

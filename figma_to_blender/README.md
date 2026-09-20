@@ -5,18 +5,21 @@ objects, rectangles become planes with a *Corner Radius* Bevel modifier, ellipse
 filled curves, icons become SVG curves (or textured planes), image fills become textured
 planes, and Figma frames/groups become parented Empties, so you can grab a whole card or menu
 and move it in 3D. Gradient fills become shader-node gradients and strokes become a Geometry
-Nodes outline. Everything is built [non-destructively](#non-destructive-by-design), and
+Nodes outline. Instances of a Figma component [share one datablock](#component-instances) so
+editing one updates all; optional [3D presets](#3d-presets) give frames, buttons and text depth
+through modifiers and curve properties; fonts are matched from a [local folder](#fonts-offline),
+offline. Everything is built [non-destructively](#non-destructive-by-design), and
 [importing again](#re-import--sync) updates what is already there instead of duplicating it.
 
 It talks to the Figma REST API directly from Blender (standard library only, no `requests`),
 and the same pure-Python core also runs as a CLI so a page can be exported once to an offline
 **scene bundle** (`scene.json` + `assets/`) and imported reproducibly later.
 
-![Fixture page imported and rendered headlessly](docs/render.png)
+![Fixture page imported with the Card 3D preset and rendered headlessly from a turned camera](docs/render.png)
 
 ## Install
 
-Download [`figma_to_blender-v0.3.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.3.0.zip)
+Download [`figma_to_blender-v0.4.0.zip`](../releases/figma_to_blender/figma_to_blender-v0.4.0.zip)
 from the repo's `releases/` folder. Alternatively, every push and pull request to [this repo](../README.md) runs the
 [Build add-ons](../.github/workflows/build-addon.yml) workflow, which runs the tests and uploads
 the zip as the `figma_to_blender` artifact (GitHub ▸ *Actions* ▸ pick the run ▸ *Artifacts*).
@@ -62,6 +65,12 @@ Open the 3D Viewport sidebar (`N`) ▸ **Figma** tab.
    - **Update existing objects** (on by default): importing the same page/frame again updates
      the earlier import in place, see [Re-import / sync](#re-import--sync). **Delete removed
      elements** deletes objects whose Figma element disappeared instead of parking them.
+   - **Component instances** box: **Link component instances** (on) and the **Mode**, see
+     [Component instances](#component-instances).
+   - **3D** box: the **3D preset** (*Flat* by default) with per-kind depths for *Custom*, and
+     **Curve screen** + **Radius**, see [3D presets](#3d-presets).
+   - **Fonts** box: the **Fonts folder** scanned for `.ttf` / `.otf` files, and after an import
+     the collapsible list of fonts that were not found, see [Fonts (offline)](#fonts-offline).
 4. **Import**. A new collection named after the page (or frame) appears, with one Empty per
    Figma frame/group and children parented to it. Every object carries `figma_id`,
    `figma_elem_id`, `figma_type`, `figma_name` custom properties; text records its Figma font
@@ -96,8 +105,36 @@ other frame. *Center at origin* still applies afterwards if you prefer the frame
 in `page_id` / `page_name` (kept for compatibility) plus `root_type` (`CANVAS` for a page,
 `FRAME`, `SECTION`, ... otherwise).
 
-The operator prints a summary (counts per kind, sync tallies, fonts not found, warnings) to the
-status bar and full warnings to the system console.
+The operator prints a summary (counts per kind, sync tallies, linked instances and overrides,
+fonts not found, warnings) to the status bar and full warnings to the system console.
+
+## Component instances
+
+Figma `INSTANCE` nodes point at a `COMPONENT` through `componentId`; their children carry ids
+of the form `I<instanceId>;<componentChildId>`. The exporter turns that into a stable
+*path inside the component* for every element (`component_id` + `component_path` in
+`scene.json`: `""` for the root, `":bg"` for its background plane, otherwise the component
+child's id, nested instances included), marks the component's own elements with
+`is_component`, and flags **overrides**: an instance element whose text, fill, gradient,
+stroke, size, corner radii or opacity differs from the component (or from the first instance
+in draw order when the component itself is not part of the export), plus whatever Figma
+reports in `INSTANCE.overrides` for those fields.
+
+With **Link component instances** (on by default) the builder keys datablocks by
+`(component_id, path)`:
+
+| Mode | What you get |
+|---|---|
+| **Linked data** (default) | One object per instance element as before, but the plane mesh / ellipse curve / text curve of a non-overridden element *is* the component's datablock (and so is its material, materials live on the data). Edit the component's text or mesh and every instance follows; an object's transform, parent, depth, custom properties and modifiers (*Corner Radius*, *Stroke*, *Depth*) stay per object with equal settings. Overridden elements get their own datablock and are listed in the report (`instances: 5 linked, 1 override(s)`). |
+| **Collection instances** | Every component that is part of the import gets its own `<name> (component)` sub-collection holding its objects (visible on the page where Figma draws the component), and each instance is a single Empty with `instance_type = COLLECTION`; the collection's *instance offset* is the component's position so the instanced copy lands where the instance is. Instances of components that are not in the export fall back to linked data. Instance overrides cannot be shown in this mode (the Empty draws the component as is). |
+
+Image planes are linked only when the instance renders the same picture (asset content hash);
+SVG icons are re-imported per instance and not linked (their curves come from the importer).
+On [re-import](#re-import--sync) a shared datablock is written once, an instance element whose
+override disappeared is relinked to the shared data, a new override gets its own copy, and
+switching the mode converts between Empties and objects (descendants replaced by a collection
+instance are parked in the *(removed)* collection). Turning the toggle off gives every element
+its own data again.
 
 ## Re-import / sync
 
@@ -135,6 +172,61 @@ lost; with **Delete removed elements** they are deleted instead. An element whos
 (a rectangle turned into an ellipse) is treated as removed + new. The report shows
 `sync: created N, updated N, moved N, removed N`. Turn **Update existing objects** off to get
 the old behaviour (always a fresh collection). *Import bundle* syncs the same way.
+
+## 3D presets
+
+**3D preset** in the panel (`BuildOptions.depth_preset`) gives the flat UI thickness, all through
+modifiers and curve properties, so the front faces stay exactly where Figma put them and every
+value remains editable:
+
+| Kind (how it is detected) | Blender | Flat | Subtle | Card |
+|---|---|---|---|---|
+| **frame**: a frame / instance background plane | Solidify modifier **Depth** (`offset = -1`, even thickness, after *Corner Radius* and *Stroke*) | 0 | 2 px | 8 px |
+| **button**: a container background whose container has a direct TEXT child and is under 400 px on its longest side, or a plain rectangle that is the first drawn child of such a container and fills it (heuristic) | Solidify **Depth** | 0 | 3 px | 6 px |
+| **shape**: other rectangles, ellipses | rect: Solidify **Depth**; ellipse: `curve.extrude` (half per side) | 0 | 1 px | 3 px |
+| **text** | `curve.extrude` + `bevel_depth` (*Text bevel*), object shifted back by the extrude | 0 | 0.5 px | 1.5 px (bevel 0.25 px) |
+| **icon**: SVG icon curves (or icon planes) | `curve.extrude` on each curve, Empty shifted back / Solidify **Depth** | 0 | 0.5 px | 1.5 px |
+| **image** planes | Solidify **Depth** | 0 | 1 px | 3 px |
+
+Values are Figma px converted with **Scale**; *Custom* shows one field per kind (`depths` in
+`BuildOptions`). The applied thickness is remembered in the `figma_depth` custom property (on
+the object for the modifier, on the curve data for extrudes, `figma_text_bevel` for the bevel).
+On re-import a value is only rewritten while it still equals what the importer applied, so a
+thickness or extrude you changed survives a preset change, *Flat* removes only the importer's
+own modifiers, and a Solidify you added yourself under the name *Depth* is never touched.
+Materials stay the unlit emission materials, so in rendered views the rims take the fill colour
+(use Solid shading or swap in a lit material to see them shaded).
+
+**Curve screen** (+ **Radius** in metres) bends the whole UI onto a cylinder facing the viewer:
+every mesh, curve and text object gets a **Screen Curve** Simple Deform modifier (*Bend*, axis Z,
+angle = −width / radius, last in the stack) whose origin is one shared Empty,
+`<collection> Curve Origin`, placed at the frame centre with X along the UI, Y into the screen
+and Z up. Because the bend is per object over its own width, all objects lie on the same
+cylinder, but a wide plane is only bent at its vertices (add a Subdivision or Remesh before
+*Screen Curve* if you need a smooth arc on a big background), and modifiers cannot sit on
+Empties, so group Empties stay where they are. The angle is stored in `figma_curve_angle` and
+synced like the depth values; turning the option off removes the importer's modifiers and the
+origin Empty (unless one of your own modifiers still uses it).
+
+## Fonts (offline)
+
+Text objects get the font Figma names, matched **offline**: first by PostScript name
+(`fontPostScriptName`, also against the file name, so `Inter-SemiBold.otf` matches), then by
+family + nearest weight with italic preferred (`fontWeight` / `italic` from the text style), then
+by family alone. Sources, in order of precedence:
+
+1. the **Fonts folder** in the panel (`BuildOptions.fonts_dir`; the add-on preference *Fonts
+   folder* is the default when the panel field is empty), scanned recursively for `.ttf` /
+   `.otf` files (`.woff` / `.woff2` are skipped because Blender cannot load them);
+2. the system fonts (`fc-list` where available, otherwise the platform font directories).
+
+Font files are read with a small built-in `name` / `OS/2` table parser; a file whose tables
+cannot be read is indexed from its `Family-Style.ttf` name. The index is cached per session (per
+folder for user folders). Nothing is downloaded. Fonts that were not found are listed per
+*family + style* with the number of text objects (`fonts not found: Inter Bold (2 text
+objects)`) in the operator report, printed to the console and shown in the panel's collapsible
+**Missing fonts (N)** list after the import; drop the files into the fonts folder and import
+again (the text keeps Blender's default font until then, `figma_font` records the family).
 
 ## CLI
 
@@ -181,6 +273,9 @@ baked into geometry, so you can keep tweaking after import:
 | Gradient fill (linear, radial, angular, diamond) | **shader nodes**: Texture Coordinate (UV; *Generated* for ellipse curves) → Mapping (from the gradient handles) → Gradient Texture → Color Ramp (the stops, colour + alpha) → Emission; one material per gradient | Mapping node (move/rotate the gradient), Color Ramp (recolour / add stops) |
 | Stroke (`strokes[0]`, `strokeWeight`, `strokeAlign`) | **Geometry Nodes modifier** *Stroke* using the shared *Figma Stroke* node group: outlines the evaluated shape (after the bevel), Width = weight × scale, Align = INSIDE / CENTER / OUTSIDE, Material = flat stroke colour, Lift above the fill | modifier inputs (width, align, material); disable or delete it to drop the stroke |
 | Text | Blender text object (`size`, `align_x/y`, `space_line`, `space_character`, text box) | data properties |
+| Component instance | the instance element's object uses the **component's datablock** (mesh / curve / text, hence material); or an Empty instancing the component's collection | edit the component once; per-object transform / modifiers stay yours |
+| 3D preset depth | **Solidify modifier** *Depth* on planes (back offset, even), `curve.extrude` / `bevel_depth` on text, ellipses and icon curves | modifier thickness, data properties; remembered in `figma_depth` so your changes survive re-import |
+| Curved screen | **Simple Deform** *Screen Curve* (Bend) per object around the shared *Curve Origin* Empty | modifier angle / origin, move the Empty |
 
 Still baked, because Blender has no parameter for it: the plane's *size* (a plane is its four
 vertices; scaling the object instead would distort the bevel), the ellipse's *size* (curve
@@ -255,7 +350,7 @@ it measures the importer's px→metre factor once, then scales each icon so the 
 matches the node size exactly (falling back to bounding-box fitting for SVGs without a
 viewBox). If the importer is unavailable, icons fall back to planes with a warning.
 
-## Limitations (v0.3)
+## Limitations (v0.4)
 
 - Only the first visible fill and the first stroke of a node are used; gradient *strokes* and
   text gradients are averaged to one colour (`fill_approx` / `figma_fill_approx`); dashed
@@ -263,19 +358,26 @@ viewBox). If the importer is unavailable, icons fall back to planes with a warni
   not imported; strokes on text and icons are skipped.
 - Effects (shadows, blurs), blend modes and masks are not imported (they do survive inside PNG
   icons/images).
-- Fonts must be installed locally; the add-on matches by PostScript name, then family + weight.
-  Otherwise Blender's default font is used and the family is recorded in `figma_font`.
+- Fonts must be available locally (fonts folder or system); `.woff` / `.woff2` cannot be
+  loaded. Otherwise Blender's default font is used, the family is recorded in `figma_font`
+  and the font is listed under *Missing fonts*.
 - Text vertical metrics are approximated (ascender ≈ 0.8 em); mixed styles within one text
   node (`characterStyleOverrides`) are not supported, the whole node uses its base style.
-- Component variants and instances are imported as they appear; auto-layout is baked to
-  absolute positions (as the API reports them).
+- Component instances share data only for rectangles, ellipses, text and identical image
+  planes; SVG icon curves are imported per instance. Overrides are detected on the data the
+  importer uses (text, fill, stroke, size, radii, opacity), not on effects or layout.
+  Auto-layout is baked to absolute positions (as the API reports them).
+- 3D presets keep the unlit emission materials (rims are flat-coloured in rendered views);
+  the *button* kind is a heuristic (see the table), and *Curve screen* bends each object about
+  its own vertices only.
 - Only the first visible fill of each node is used; `clipsContent` is ignored.
 
 ## Roadmap
 
 - Drop shadows as translucent planes, dashed strokes.
 - Per-run text styling from `characterStyleOverrides`.
-- Extrude presets (depth per kind).
+- Optional lit (Principled) materials so 3D preset rims are shaded in rendered views.
+- Link SVG icon curves between component instances.
 - Resurrect an element from the *(removed)* collection when its id comes back.
 
 ## Development
@@ -296,8 +398,13 @@ Bevel modifier (width, segments, per-corner vertex weights, evaluated vertex cou
 ellipse curve (2D, fill BOTH, dimensions), a single-frame import (collection named after the
 frame, background plane cornered at the origin, only the subtree built), the gradient
 material node trees, the *Stroke* modifier (evaluated extents per alignment, shared node
-group) and re-import: a no-op second import, Figma edits applied in place while user
-modifiers / materials / properties survive, removed elements parked, legacy objects matched.
+group), re-import (a no-op second import, Figma edits applied in place while user
+modifiers / materials / properties survive, removed elements parked, legacy objects matched),
+component instances (shared datablocks, overrides, sync relinking / unsharing, collection
+instances and mode switches), 3D presets (kinds, *Depth* / extrude values, front faces
+unchanged, custom depths, sync keeping user edits, the curved screen's geometry) and the fonts
+folder (matched by file name, missing list with counts, stored on the scene).
+`tests/test_fonts.py` covers the pure-Python font index and matching.
 
 ## License
 

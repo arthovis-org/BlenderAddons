@@ -8,10 +8,10 @@ classes are only defined when it is available.
 bl_info = {
     "name": "Figma to Blender",
     "author": "arthovis-org",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (5, 0, 0),
     "location": "3D Viewport > Sidebar (N) > Figma",
-    "description": "Import a Figma page or a single frame as editable 3D UI: text, rounded shapes, gradients, strokes, icons (SVG curves or planes) and images; re-import updates existing objects",
+    "description": "Import a Figma page or a single frame as editable 3D UI: text, rounded shapes, gradients, strokes, icons and images, component instances as linked data, 3D depth presets, offline fonts; re-import updates existing objects",
     "doc_url": "https://github.com/arthovis-org/BlenderAddons",
     "tracker_url": "https://github.com/arthovis-org/BlenderAddons/issues",
     "category": "Import-Export",
