@@ -30,11 +30,26 @@ FIXTURE = os.path.join(HERE, "fixtures", "sample_page.json")
 ASSETS = os.path.join(HERE, "fixtures", "assets")
 
 
-def make_bundle(out_dir, icon_format="svg", font_override=None):
-    """Write a bundle from the fixture using the tiny SVG/PNG as every asset."""
+def find_node(node, node_id):
+    if node.get("id") == node_id:
+        return node
+    for child in node.get("children") or []:
+        found = find_node(child, node_id)
+        if found is not None:
+            return found
+    return None
+
+
+def make_bundle(out_dir, icon_format="svg", font_override=None, root_id=None):
+    """Write a bundle from the fixture using the tiny SVG/PNG as every asset.
+
+    ``root_id`` builds the bundle from that single node (frame import) instead
+    of the whole fixture page.
+    """
     with open(FIXTURE, "r", encoding="utf-8") as fh:
         page = json.load(fh)["nodes"]["0:1"]["document"]
-    scene = build_scene(page, ExportOptions(icon_format=icon_format), file_key="FIXTURE")
+    root = find_node(page, root_id) if root_id else page
+    scene = build_scene(root, ExportOptions(icon_format=icon_format), file_key="FIXTURE")
     os.makedirs(os.path.join(out_dir, "assets"), exist_ok=True)
     for el in scene.elements:
         if not el.asset:
@@ -360,6 +375,44 @@ class BuilderTests(unittest.TestCase):
         self.assertAlmostEqual(ellipse.location.x, 0.156, places=6)
         self.assertAlmostEqual(ellipse.location.z, -0.492, places=6)
 
+    def test_frame_root_collection_named_after_frame_at_origin(self):
+        from figma_to_blender import builder
+
+        make_bundle(self.tmp, root_id="1:2")
+        scene = load_scene(self.tmp)
+        self.assertEqual(scene.root_type, "FRAME")
+        report = builder.build_bundle(self.tmp, builder.BuildOptions(icon_mode="SVG", center=False))
+        # the collection takes the frame's name, not the page's
+        self.assertIn("Card", bpy.data.collections)
+        self.assertNotIn("Page 1", bpy.data.collections)
+        self.assertIs(report.collection, bpy.data.collections["Card"])
+        self.assertEqual(report.collection["figma_page_id"], "1:2")
+        # only the Card subtree was built: 4 groups, 4 rects, 4 texts, 1 ellipse, 1 image, 3 icons
+        self.assertEqual(report.counts, {"group": 4, "rect": 4, "text": 4, "ellipse": 1, "image": 1, "icon": 3})
+        self.assertFalse([o for o in report.objects if o.name in ("Standalone label", "Big vector frame")])
+        # the frame's Empty sits at the world origin and its background plane has its
+        # top-left corner there (360x480 px plane, centre at (180, -240) mm, depth index 1)
+        card = self._by_name(report, "Card")
+        self.assertEqual(card.type, "EMPTY")
+        self.assertAlmostEqual(card.location.x, 0.0, places=6)
+        self.assertAlmostEqual(card.location.z, 0.0, places=6)
+        bg = self._by_name(report, "Card (background)")
+        self.assertEqual(bg.parent, card)
+        self.assertAlmostEqual(bg.location.x, 0.180, places=6)
+        self.assertAlmostEqual(bg.location.z, -0.240, places=6)
+        self.assertAlmostEqual(bg.location.y, -1 * 0.0005, places=6)
+        lo, hi = obj_bbox([bg])
+        self.assertAlmostEqual(lo.x, 0.0, places=6)
+        self.assertAlmostEqual(hi.z, 0.0, places=6)
+        self.assertAlmostEqual(hi.x, 0.360, places=6)
+        self.assertAlmostEqual(lo.z, -0.480, places=6)
+        self._corner_modifier(bg)  # still a plane + Corner Radius modifier
+        # children moved with the frame: Title was at page (124, 340) -> (24, 140)
+        title = self._by_name(report, "Title")
+        self.assertAlmostEqual(title.location.x, 0.024, places=6)
+        self.assertLess(title.location.z, -0.140)
+        self.assertGreater(title.location.z, -0.140 - 0.05)
+
     def test_missing_asset_is_reported_not_fatal(self):
         from figma_to_blender import builder
 
@@ -400,6 +453,16 @@ class BuilderTests(unittest.TestCase):
             os.environ.pop("FIGMA_TOKEN", None)
             s.file_url = "https://www.figma.com/design/KEY/x"
             self.assertTrue(self._cancelled(bpy.ops.figma.fetch_pages))
+            self.assertTrue(hasattr(bpy.ops.figma, "fetch_frames"))
+            # frame dropdown always offers the whole page; an unparsable node reference is refused
+            # before any network access (no token set, no pages fetched)
+            self.assertEqual(s.frame, "PAGE")
+            s.node_ref = "https://www.figma.com/design/KEY/x"  # no node-id
+            self.assertTrue(self._cancelled(bpy.ops.figma.import_page))
+            self.assertTrue(self._cancelled(bpy.ops.figma.fetch_frames))  # needs a page first
+            self.assertEqual(figma_to_blender.resolve_target.__name__, "resolve_target")
+            s.node_ref = "https://www.figma.com/design/KEY/x?node-id=1-2"
+            self.assertEqual(figma_to_blender.resolve_target(s), ("1:2", "node 1:2"))
         finally:
             figma_to_blender.unregister()
         self.assertFalse(hasattr(bpy.types.Scene, "figma_to_blender"))

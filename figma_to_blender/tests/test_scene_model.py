@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 
 from figma_to_blender import cli, figma_api, scene_model  # noqa: E402
-from figma_to_blender.figma_api import FigmaClient, parse_file_key, sanitize_id  # noqa: E402
+from figma_to_blender.figma_api import FigmaClient, parse_file_key, parse_node_id, sanitize_id  # noqa: E402
 from figma_to_blender.scene_model import ExportOptions, build_scene, load_scene, write_scene  # noqa: E402
 
 FIXTURE = os.path.join(HERE, "fixtures", "sample_page.json")
@@ -27,6 +27,23 @@ def load_page():
 
 def by_id(scene, el_id):
     return next(e for e in scene.elements if e.id == el_id)
+
+
+def find_node(node, node_id):
+    if node.get("id") == node_id:
+        return node
+    for child in node.get("children") or []:
+        found = find_node(child, node_id)
+        if found is not None:
+            return found
+    return None
+
+
+def subtree_ids(node):
+    ids = {node["id"]}
+    for child in node.get("children") or []:
+        ids |= subtree_ids(child)
+    return ids
 
 
 class ParseKeyTests(unittest.TestCase):
@@ -48,6 +65,25 @@ class ParseKeyTests(unittest.TestCase):
     def test_sanitize(self):
         self.assertEqual(sanitize_id("1:23"), "1_23")
         self.assertEqual(sanitize_id("I12:3;45:6"), "I12_3_45_6")
+
+
+class ParseNodeIdTests(unittest.TestCase):
+    def test_raw_id(self):
+        self.assertEqual(parse_node_id("12:345"), "12:345")
+        self.assertEqual(parse_node_id("  0:1 "), "0:1")
+        self.assertEqual(parse_node_id("12-345"), "12:345")  # URL spelling typed by hand
+        self.assertEqual(parse_node_id("I12:3;45:6"), "I12:3;45:6")  # instance id
+
+    def test_url_with_node_id(self):
+        self.assertEqual(parse_node_id("https://www.figma.com/design/AbC123/My-File?node-id=1-2&t=abc"), "1:2")
+        self.assertEqual(parse_node_id("https://www.figma.com/design/AbC123/My-File?node-id=12%3A345"), "12:345")
+        self.assertEqual(parse_node_id("https://www.figma.com/design/K/x?node-id=I12-3%3B45-6&m=dev"), "I12:3;45:6")
+
+    def test_url_without_node_id(self):
+        self.assertIsNone(parse_node_id("https://www.figma.com/design/AbC123/My-File"))
+        self.assertIsNone(parse_node_id("https://www.figma.com/design/AbC123/My-File?t=abc"))
+        self.assertIsNone(parse_node_id(""))
+        self.assertIsNone(parse_node_id("Card"))
 
 
 class BuildSceneTests(unittest.TestCase):
@@ -193,6 +229,98 @@ class BuildSceneTests(unittest.TestCase):
         scene = build_scene(page)
         self.assertEqual(scene.elements, [])
         self.assertIn("SLICE", scene.warnings[0])
+        self.assertEqual(scene.root_type, "CANVAS")
+
+
+class FrameRootTests(unittest.TestCase):
+    """build_scene() with a single FRAME (not the CANVAS) as the root."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.page = load_page()
+        cls.card = find_node(cls.page, "1:2")
+        cls.scene = build_scene(cls.card, ExportOptions(), file_key="KEY")
+        cls.page_scene = build_scene(cls.page, ExportOptions(), file_key="KEY")
+
+    def test_root_metadata(self):
+        self.assertEqual(self.scene.page_id, "1:2")
+        self.assertEqual(self.scene.page_name, "Card")
+        self.assertEqual(self.scene.root_type, "FRAME")
+        self.assertEqual(self.scene.file_key, "KEY")
+
+    def test_root_is_first_element_with_its_fill(self):
+        first, bg = self.scene.elements[0], self.scene.elements[1]
+        self.assertEqual((first.id, first.kind, first.figma_type), ("1:2", "group", "FRAME"))
+        self.assertIsNone(first.parent)
+        self.assertEqual(bg.id, "1:2:bg")
+        self.assertEqual(bg.kind, "rect")
+        self.assertEqual(bg.parent, "1:2")
+        self.assertEqual(bg.fill, [1.0, 1.0, 1.0, 1.0])
+        self.assertEqual(bg.corner_radii, [16.0] * 4)
+        self.assertEqual((bg.w, bg.h), (360.0, 480.0))
+
+    def test_root_top_left_at_origin(self):
+        for el in self.scene.elements[:2]:
+            self.assertAlmostEqual(el.x, 0.0)
+            self.assertAlmostEqual(el.y, 0.0)
+            self.assertEqual(el.matrix, [1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+        b = self.scene.bounds
+        self.assertAlmostEqual(b["x"], 0.0)
+        self.assertAlmostEqual(b["y"], 0.0)
+        self.assertAlmostEqual(b["w"], 360.0)
+        self.assertAlmostEqual(b["h"], 480.0)
+
+    def test_children_offset_by_root_translation(self):
+        # Card sits at (100, 200) on the page; inside the frame import everything moves by (-100, -200)
+        ids = [e.id for e in self.scene.elements]
+        for el in self.scene.elements:
+            ref = by_id(self.page_scene, el.id)
+            self.assertAlmostEqual(el.x, ref.x - 100.0, places=6, msg=el.id)
+            self.assertAlmostEqual(el.y, ref.y - 200.0, places=6, msg=el.id)
+            self.assertAlmostEqual(el.rotation, ref.rotation, places=6)
+            self.assertEqual(el.parent, ref.parent)
+        self.assertEqual(ids, [e.id for e in self.page_scene.elements if e.id in set(ids)])  # same draw order
+        title = by_id(self.scene, "1:4")
+        self.assertEqual((title.x, title.y), (24.0, 140.0))
+        label = by_id(self.scene, "1:12")  # Button(24,400) + (16,14)
+        self.assertEqual((label.x, label.y), (40.0, 414.0))
+
+    def test_element_count_is_the_subtree(self):
+        wanted = subtree_ids(self.card)
+        expected = [e for e in self.page_scene.elements if e.id.split("#")[0].split(":bg")[0] in wanted]
+        self.assertEqual(len(self.scene.elements), len(expected))
+        self.assertEqual(len(self.scene.elements), 17)
+        self.assertFalse(any(e.id in ("1:18", "1:19", "1:20", "1:21") for e in self.scene.elements))
+
+    def test_rotated_root_keeps_rotation(self):
+        badge = find_node(self.page, "1:14")
+        scene = build_scene(badge)
+        self.assertEqual([e.id for e in scene.elements], ["1:14", "1:14:bg", "1:15"])
+        root = scene.elements[0]
+        self.assertAlmostEqual(root.x, 0.0)
+        self.assertAlmostEqual(root.y, 0.0)
+        self.assertAlmostEqual(root.rotation, 15.0, places=5)
+        txt = by_id(scene, "1:15")
+        a = math.radians(15.0)
+        self.assertAlmostEqual(txt.x, math.cos(a) * 6 + math.sin(a) * 4, places=5)
+        self.assertAlmostEqual(txt.y, -math.sin(a) * 6 + math.cos(a) * 4, places=5)
+        self.assertAlmostEqual(txt.rotation, 15.0, places=5)
+
+    def test_leaf_root_and_absolute_bbox_root(self):
+        text = find_node(self.page, "1:18")  # only has absoluteBoundingBox
+        scene = build_scene(text)
+        self.assertEqual(scene.root_type, "TEXT")
+        self.assertEqual(len(scene.elements), 1)
+        self.assertEqual((scene.elements[0].x, scene.elements[0].y, scene.elements[0].w), (0.0, 0.0, 200.0))
+
+    def test_roundtrip_keeps_root_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            write_scene(self.scene, tmp)
+            loaded = load_scene(tmp)
+        self.assertEqual(loaded.root_type, "FRAME")
+        self.assertEqual(loaded.page_name, "Card")
+        # bundles written before root_type existed default to a page
+        self.assertEqual(scene_model.scene_from_dict({"page_id": "0:1", "elements": []}).root_type, "CANVAS")
 
 
 class FakeClient:
@@ -267,6 +395,48 @@ class ClientTests(unittest.TestCase):
                 client.get_file_meta("KEY")
         self.assertEqual(cm.exception.status, 403)
 
+    def test_get_node_and_page_alias(self):
+        client = FigmaClient("tok", max_retries=0)
+        page = load_page()
+        with mock.patch.object(client, "_get_json", return_value={"nodes": {"1:2": {"document": page["children"][0]}}}) as gj:
+            node = client.get_node("KEY", "1:2")
+        self.assertEqual(node["name"], "Card")
+        gj.assert_called_once_with("/files/KEY/nodes", {"ids": "1:2", "geometry": "paths"})
+        with mock.patch.object(client, "_get_json", return_value={"nodes": {}}):
+            with self.assertRaises(figma_api.FigmaError):
+                client.get_page("KEY", "0:1")
+
+    def test_list_top_level_frames(self):
+        client = FigmaClient("tok", max_retries=0)
+        response = {
+            "nodes": {
+                "0:1": {
+                    "document": {
+                        "id": "0:1",
+                        "type": "CANVAS",
+                        "name": "Page 1",
+                        "children": [
+                            {"id": "1:2", "name": "Card", "type": "FRAME"},
+                            {"id": "1:18", "name": "Standalone label", "type": "TEXT"},
+                            {"id": "1:30", "name": "Hidden", "type": "FRAME", "visible": False},
+                            {"id": "1:19", "name": "Big vector frame", "type": "SECTION"},
+                        ],
+                    }
+                }
+            }
+        }
+        with mock.patch.object(client, "_get_json", return_value=response) as gj:
+            frames = client.list_top_level_frames("KEY", "0:1")
+        gj.assert_called_once_with("/files/KEY/nodes", {"ids": "0:1", "geometry": "paths", "depth": "1"})
+        self.assertEqual(
+            frames,
+            [
+                {"id": "1:2", "name": "Card", "type": "FRAME"},
+                {"id": "1:18", "name": "Standalone label", "type": "TEXT"},
+                {"id": "1:19", "name": "Big vector frame", "type": "SECTION"},
+            ],
+        )
+
     def test_export_images_batches_and_survives_failure(self):
         client = FigmaClient("tok", max_retries=0)
         ids = ["n%d" % i for i in range(45)]
@@ -307,15 +477,58 @@ class CliTests(unittest.TestCase):
         with mock.patch.object(cli, "FigmaClient") as FC, tempfile.TemporaryDirectory() as tmp:
             inst = FC.return_value
             inst.list_pages.return_value = [{"id": "0:1", "name": "Page 1"}]
-            inst.get_page.return_value = page
+            inst.get_node.return_value = page
             fake = FakeClient()
             inst.export_images.side_effect = fake.export_images
             inst.download.side_effect = fake.download
             rc = cli.main(["--token", "t", "--file", "KEY", "--page", "Page 1", "--out", tmp, "--icon-format", "png"])
             self.assertEqual(rc, 0)
+            inst.get_node.assert_called_with("KEY", "0:1")
             scene = load_scene(tmp)
             self.assertTrue(os.path.exists(os.path.join(tmp, "assets", "icon_1_9.png")))
         self.assertEqual(len(scene.by_kind("icon")), 5)
+
+    def test_export_single_node_by_url(self):
+        card = find_node(load_page(), "1:2")
+        url = "https://www.figma.com/design/KEY1/My-File?node-id=1-2&t=abc"
+        with mock.patch.object(cli, "FigmaClient") as FC, tempfile.TemporaryDirectory() as tmp:
+            inst = FC.return_value
+            inst.get_node.return_value = card
+            fake = FakeClient()
+            inst.export_images.side_effect = fake.export_images
+            inst.download.side_effect = fake.download
+            rc = cli.main(["--token", "t", "--file", url, "--node", url, "--out", tmp])
+            self.assertEqual(rc, 0)
+            inst.list_pages.assert_not_called()  # --node skips the page lookup
+            inst.get_node.assert_called_once_with("KEY1", "1:2")
+            scene = load_scene(tmp)
+        self.assertEqual(scene.page_name, "Card")
+        self.assertEqual(scene.root_type, "FRAME")
+        self.assertEqual(len(scene.elements), 17)
+        self.assertEqual((scene.elements[0].x, scene.elements[0].y), (0.0, 0.0))
+
+    def test_node_and_page_are_exclusive_and_node_must_parse(self):
+        with self.assertRaises(SystemExit):
+            cli.main(["--token", "t", "--file", "KEY", "--page", "P", "--node", "1:2"])
+        with mock.patch.object(cli, "FigmaClient"):
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                rc = cli.main(["--token", "t", "--file", "KEY", "--node", "https://www.figma.com/design/KEY/x"])
+        self.assertEqual(rc, 2)
+        self.assertIn("node-id", err.getvalue())
+
+    def test_list_frames(self):
+        with mock.patch.object(cli, "FigmaClient") as FC:
+            inst = FC.return_value
+            inst.list_pages.return_value = [{"id": "0:1", "name": "Page 1"}]
+            inst.list_top_level_frames.return_value = [{"id": "1:2", "name": "Card", "type": "FRAME"}]
+            buf = io.StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = cli.main(["--token", "t", "--file", "KEY", "--page", "Page 1", "--list-frames"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "1:2\tFRAME\tCard")
+        inst.list_top_level_frames.assert_called_once_with("KEY", "0:1")
+        inst.get_node.assert_not_called()
 
 
 if __name__ == "__main__":
