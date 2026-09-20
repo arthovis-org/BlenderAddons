@@ -1,15 +1,19 @@
-"""Best-effort lookup of installed system fonts by family / PostScript name.
+"""Best-effort, fully offline lookup of fonts by family / PostScript name.
 
 Strategy:
 
-1. If ``fc-list`` (fontconfig) is available (Linux, many macOS installs) ask it
-   for ``file|family|postscriptname|weight|style`` of every font.
-2. Otherwise scan the standard font directories of the current platform and
-   read the ``name`` and ``OS/2`` tables of every ``.ttf`` / ``.otf`` file with
-   a tiny built-in parser.
+1. A user *fonts folder* (``BuildOptions.fonts_dir`` / the add-on preference)
+   is scanned recursively for ``.ttf`` / ``.otf`` files (``.woff`` / ``.woff2``
+   are skipped: Blender cannot load them) and its fonts win over system fonts.
+2. If ``fc-list`` (fontconfig) is available (Linux, many macOS installs) ask it
+   for ``file|family|postscriptname|weight|style`` of every system font.
+3. Otherwise scan the standard font directories of the current platform.
 
-Both paths feed the same in-memory index; lookups are cached per process.
-No ``bpy`` import so the CLI can use it for diagnostics too.
+Font files are read with a tiny built-in ``name`` / ``OS/2`` table parser; a
+file whose tables cannot be read is indexed from its file name
+(``Family-Style.ttf``).  Every path feeds the same in-memory index, cached per
+process (per folder for user folders).  Nothing is downloaded and no ``bpy``
+is imported, so the CLI can use it for diagnostics too.
 """
 
 from __future__ import annotations
@@ -22,11 +26,12 @@ import struct
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
 FONT_EXTS = (".ttf", ".otf", ".TTF", ".OTF")
+SKIPPED_EXTS = (".woff", ".woff2", ".WOFF", ".WOFF2")  # web fonts: Blender's font loader does not read them
 
 _WEIGHT_WORDS = {
     "thin": 100,
@@ -69,6 +74,73 @@ def style_to_weight(style: str) -> int:
             best = w
             break
     return best
+
+
+_WEIGHT_NAMES = {
+    100: "Thin",
+    200: "Extra Light",
+    300: "Light",
+    400: "Regular",
+    500: "Medium",
+    600: "Semi Bold",
+    700: "Bold",
+    800: "Extra Bold",
+    900: "Black",
+}
+
+
+def weight_style_name(weight: Optional[int], italic: bool = False) -> str:
+    """``(700, True)`` -> ``"Bold Italic"``: the style name for a CSS weight (nearest hundred)."""
+    try:
+        w = int(float(weight or 400) / 100.0 + 0.5) * 100  # nearest hundred (650 -> 700)
+    except (TypeError, ValueError):
+        w = 400
+    name = _WEIGHT_NAMES.get(max(100, min(900, w)), "Regular")
+    if italic:
+        name = "Italic" if name == "Regular" else name + " Italic"
+    return name
+
+
+def style_is_italic(style: str) -> bool:
+    s = style.lower()
+    return "italic" in s or "oblique" in s
+
+
+def entry_from_filename(path: str) -> FontEntry:
+    """Index a font from its file name alone (``Family-Style.ttf``), for files whose tables cannot be read."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    family, style = stem, ""
+    for sep in ("-", "_"):
+        if sep in stem:
+            family, style = stem.rsplit(sep, 1)
+            break
+    # "OpenSans" -> "Open Sans" so it compares equal to Figma's family name after normalisation anyway
+    family = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", family).strip()
+    return FontEntry(path=path, family=family, postscript=stem, weight=style_to_weight(style), italic=style_is_italic(style))
+
+
+def read_font_file(path: str) -> Optional[FontEntry]:
+    """A :class:`FontEntry` for a ``.ttf`` / ``.otf`` file, from its tables or, failing that, its file name."""
+    if not path.endswith(FONT_EXTS):
+        return None
+    return _read_name_table(path) or entry_from_filename(path)
+
+
+def scan_dir(directory: str) -> List[FontEntry]:
+    """Every font file under ``directory`` (recursive); web fonts are skipped with a debug log."""
+    entries: List[FontEntry] = []
+    if not directory or not os.path.isdir(directory):
+        return entries
+    for root, _dirs, files in os.walk(directory):
+        for fn in sorted(files):
+            full = os.path.join(root, fn)
+            if fn.endswith(SKIPPED_EXTS):
+                log.debug("Skipping web font %s (Blender cannot load woff/woff2)", full)
+                continue
+            e = read_font_file(full)
+            if e:
+                entries.append(e)
+    return entries
 
 
 def font_dirs() -> List[str]:
@@ -168,12 +240,7 @@ def _read_name_table(path: str) -> Optional[FontEntry]:
 def _scan_dirs() -> List[FontEntry]:
     entries: List[FontEntry] = []
     for d in font_dirs():
-        for root, _dirs, files in os.walk(d):
-            for fn in files:
-                if fn.endswith(FONT_EXTS):
-                    e = _read_name_table(os.path.join(root, fn))
-                    if e:
-                        entries.append(e)
+        entries.extend(scan_dir(d))
     return entries
 
 
@@ -218,9 +285,10 @@ def _fc_weight_to_css(w: float) -> int:
 
 
 _INDEX: Optional[List[FontEntry]] = None
+_USER_INDEX: Dict[str, List[FontEntry]] = {}  # user fonts folder -> entries, cached per process
 
 
-def font_index(refresh: bool = False) -> List[FontEntry]:
+def system_font_index(refresh: bool = False) -> List[FontEntry]:
     global _INDEX
     if _INDEX is None or refresh:
         entries = _fc_list()
@@ -231,19 +299,41 @@ def font_index(refresh: bool = False) -> List[FontEntry]:
     return _INDEX
 
 
+def user_font_index(user_dirs: Optional[Sequence[str]], refresh: bool = False) -> List[FontEntry]:
+    """Fonts of the user's folders (scanned once per folder per session; ``refresh`` rescans)."""
+    entries: List[FontEntry] = []
+    for d in user_dirs or ():
+        if not d:
+            continue
+        d = os.path.abspath(os.path.expanduser(d))
+        if refresh or d not in _USER_INDEX:
+            _USER_INDEX[d] = scan_dir(d)
+            log.debug("Indexed %d fonts in %s", len(_USER_INDEX[d]), d)
+        entries.extend(_USER_INDEX[d])
+    return entries
+
+
+def font_index(refresh: bool = False, user_dirs: Optional[Sequence[str]] = None) -> List[FontEntry]:
+    """User folder fonts first (they win ties), then the system fonts."""
+    return user_font_index(user_dirs, refresh) + system_font_index(refresh)
+
+
 def find_font(
     family: Optional[str] = None,
     postscript_name: Optional[str] = None,
     weight: Optional[int] = None,
     italic: bool = False,
     index: Optional[List[FontEntry]] = None,
+    user_dirs: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
     """Return a font file path or ``None``.
 
-    Order of preference: exact PostScript name, then family + closest weight
-    (+ italic match), then family only.
+    Order of preference: exact PostScript name (also matched against the file
+    name, ``Inter-SemiBold.otf``), then family + closest weight (+ italic
+    match), then family only.  ``user_dirs`` are scanned in addition to the
+    system fonts and take precedence.
     """
-    entries = index if index is not None else font_index()
+    entries = index if index is not None else font_index(user_dirs=user_dirs)
     if not entries:
         return None
     if postscript_name:

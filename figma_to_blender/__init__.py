@@ -50,10 +50,23 @@ if bpy is not None:
             subtype="PASSWORD",
         )
 
+        fonts_dir: StringProperty(
+            name="Fonts folder",
+            description="Default folder scanned (recursively) for .ttf / .otf fonts before the system fonts; "
+            "the panel's Fonts folder overrides it per scene. Nothing is downloaded",
+            subtype="DIR_PATH",
+        )
+
         def draw(self, context):
             layout = self.layout
             layout.prop(self, "token")
             layout.label(text="Needs the 'File content' read scope. The token is stored in your Blender preferences.", icon="INFO")
+            layout.prop(self, "fonts_dir")
+
+    def get_pref(context, name: str, default=""):
+        addon = context.preferences.addons.get(ADDON_ID)
+        prefs = addon.preferences if addon and hasattr(addon, "preferences") else None
+        return getattr(prefs, name, default) if prefs is not None else default
 
     def get_token(context) -> str:
         addon = context.preferences.addons.get(ADDON_ID)
@@ -211,10 +224,18 @@ if bpy is not None:
             default=False,
         )
         curve_radius: FloatProperty(name="Radius", description="Cylinder radius in metres", default=1.0, min=0.01, unit="LENGTH")
+        fonts_dir: StringProperty(
+            name="Fonts folder",
+            description="Folder scanned (recursively) for .ttf / .otf fonts before the system fonts; empty = the add-on preference",
+            subtype="DIR_PATH",
+        )
+        missing_fonts: StringProperty(name="Missing fonts", description="Fonts the last import could not find (one per line)", options={"HIDDEN"})
+        show_missing_fonts: BoolProperty(name="Show missing fonts", default=True)
         bundle_dir: StringProperty(name="Bundle folder", description="Folder containing scene.json and assets/", subtype="DIR_PATH")
         export_dir: StringProperty(name="Export to", description="Folder to write the bundle into", subtype="DIR_PATH")
 
-    def build_options(s: "FIGMA_settings") -> builder.BuildOptions:
+    def build_options(s: "FIGMA_settings", context=None) -> builder.BuildOptions:
+        fonts_dir = s.fonts_dir or (get_pref(context, "fonts_dir") if context is not None else "")
         return builder.BuildOptions(
             scale=s.scale,
             depth_step=s.depth_step,
@@ -242,6 +263,7 @@ if bpy is not None:
             ),
             curve_screen=s.curve_screen,
             curve_radius=s.curve_radius,
+            fonts_dir=bpy.path.abspath(fonts_dir) if fonts_dir else None,
         )
 
     def export_options(s: "FIGMA_settings") -> scene_model.ExportOptions:
@@ -256,9 +278,13 @@ if bpy is not None:
             return None
         return FigmaClient(token)
 
-    def _report_build(op: Operator, report: builder.BuildReport):
+    def _report_build(op: Operator, report: builder.BuildReport, context=None):
         for w in report.warnings:
             print("[figma_to_blender] warning:", w)
+        for label in report.missing_font_labels():
+            print("[figma_to_blender] font not found:", label)
+        if context is not None:
+            context.scene.figma_to_blender.missing_fonts = "\n".join(report.missing_font_labels())
         level = {"WARNING"} if (report.warnings or report.missing_fonts) else {"INFO"}
         op.report(level, report.summary() + (" (see console for details)" if report.warnings else ""))
 
@@ -367,12 +393,12 @@ if bpy is not None:
             if scene is None:
                 return {"CANCELLED"}
             try:
-                report = builder.build_scene(scene, out_dir, build_options(s))
+                report = builder.build_scene(scene, out_dir, build_options(s, context))
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
                 self.report({"ERROR"}, "Build failed, see console")
                 return {"CANCELLED"}
-            _report_build(self, report)
+            _report_build(self, report, context)
             return {"FINISHED"}
 
     class FIGMA_OT_export_bundle(_ExportMixin, Operator):
@@ -404,12 +430,12 @@ if bpy is not None:
                 self.report({"ERROR"}, "Bundle folder must contain scene.json")
                 return {"CANCELLED"}
             try:
-                report = builder.build_bundle(bundle_dir, build_options(s))
+                report = builder.build_bundle(bundle_dir, build_options(s, context))
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
                 self.report({"ERROR"}, "Build failed, see console")
                 return {"CANCELLED"}
-            _report_build(self, report)
+            _report_build(self, report, context)
             return {"FINISHED"}
 
     # ------------------------------------------------------------------
@@ -472,6 +498,27 @@ if bpy is not None:
             sub = row.row()
             sub.active = s.curve_screen
             sub.prop(s, "curve_radius")
+
+            box = layout.box()
+            box.label(text="Fonts", icon="FONT_DATA")
+            box.prop(s, "fonts_dir", text="")
+            if not s.fonts_dir and get_pref(context, "fonts_dir"):
+                box.label(text="Using the preference folder", icon="INFO")
+            missing = [line for line in s.missing_fonts.split("\n") if line]
+            if missing:
+                row = box.row()
+                row.prop(
+                    s,
+                    "show_missing_fonts",
+                    text="Missing fonts (%d)" % len(missing),
+                    icon="TRIA_DOWN" if s.show_missing_fonts else "TRIA_RIGHT",
+                    emboss=False,
+                )
+                if s.show_missing_fonts:
+                    col = box.column(align=True)
+                    for line in missing:
+                        col.label(text=line, icon="ERROR")
+                    col.label(text="Put the .ttf / .otf files in the fonts folder and import again", icon="INFO")
             layout.operator(FIGMA_OT_import_page.bl_idname, icon="IMPORT")
 
             box = layout.box()

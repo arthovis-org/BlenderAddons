@@ -104,6 +104,8 @@ class BuildOptions:
     # frame centre so the UI approximates a cylinder of ``curve_radius`` metres facing the viewer.
     curve_screen: bool = False
     curve_radius: float = 1.0
+    # Fonts: a folder scanned recursively for .ttf / .otf files, matched before the system fonts (offline).
+    fonts_dir: Optional[str] = None
 
 
 def resolve_depths(preset: str, overrides: Optional[Dict[str, float]] = None) -> Dict[str, float]:
@@ -119,7 +121,8 @@ def resolve_depths(preset: str, overrides: Optional[Dict[str, float]] = None) ->
 class BuildReport:
     counts: Dict[str, int] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
-    missing_fonts: List[str] = field(default_factory=list)
+    # fonts that were not found: {"family", "style", "postscript", "count"} per family + style, count = text objects
+    missing_fonts: List[Dict[str, object]] = field(default_factory=list)
     objects: List["bpy.types.Object"] = field(default_factory=list)
     collection: Optional["bpy.types.Collection"] = None
     # re-sync tallies: created / updated (in place) / moved (to the removed collection) / removed (deleted)
@@ -129,6 +132,24 @@ class BuildReport:
 
     def bump(self, kind: str) -> None:
         self.counts[kind] = self.counts.get(kind, 0) + 1
+
+    def font_missing(self, family: str, style: str, postscript: str = "") -> None:
+        for entry in self.missing_fonts:
+            if entry["family"] == family and entry["style"] == style:
+                entry["count"] = int(entry["count"]) + 1
+                return
+        self.missing_fonts.append({"family": family, "style": style, "postscript": postscript, "count": 1})
+
+    def missing_font_families(self) -> List[str]:
+        return sorted({str(e["family"]) for e in self.missing_fonts})
+
+    def missing_font_labels(self) -> List[str]:
+        """``"Inter Bold (2 text objects)"`` per missing family + style, sorted."""
+        out = []
+        for e in sorted(self.missing_fonts, key=lambda e: (str(e["family"]), str(e["style"]))):
+            n = int(e["count"])
+            out.append("%s %s (%d text object%s)" % (e["family"], e["style"], n, "" if n == 1 else "s"))
+        return out
 
     def summary(self) -> str:
         parts = ["%s=%d" % kv for kv in sorted(self.counts.items())]
@@ -140,7 +161,7 @@ class BuildReport:
             if self.overrides:
                 s += ", %d override(s)" % len(self.overrides)
         if self.missing_fonts:
-            s += "; fonts not found: " + ", ".join(sorted(set(self.missing_fonts)))
+            s += "; fonts not found: " + ", ".join(self.missing_font_labels())
         if self.warnings:
             s += "; %d warning(s)" % len(self.warnings)
         return s
@@ -1608,6 +1629,7 @@ class SceneBuilder:
             postscript_name=info.get("fontPostScriptName"),
             weight=info.get("fontWeight"),
             italic=bool(info.get("italic")),
+            user_dirs=[self.opt.fonts_dir] if self.opt.fonts_dir else None,
         )
         font = None
         if path:
@@ -1669,9 +1691,11 @@ class SceneBuilder:
                 cu.font = font
             ob["figma_font_file"] = font_key(cu.font)
         if font is None:
-            fam = info.get("fontFamily") or "?"
-            if fam not in self.report.missing_fonts:
-                self.report.missing_fonts.append(fam)
+            self.report.font_missing(
+                info.get("fontFamily") or "?",
+                fonts.weight_style_name(info.get("fontWeight"), bool(info.get("italic"))),
+                info.get("fontPostScriptName") or "",
+            )
         ob["figma_font"] = info.get("fontFamily") or ""
         ob["figma_font_postscript"] = info.get("fontPostScriptName") or ""
         # text keeps a solid colour: for a gradient fill that is the stops' average

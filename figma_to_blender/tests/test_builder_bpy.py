@@ -219,8 +219,12 @@ class BuilderTests(unittest.TestCase):
         self.assertLess(max(p.z for p in pts), -0.340 + 0.002)
         self.assertGreater(min(p.z for p in pts), -0.372 - 0.004)
         self.assertGreater(min(p.x for p in pts), 0.124 - 0.001)
-        # Inter is not installed here -> recorded, custom property set
-        self.assertIn("Inter", report.missing_fonts)
+        # Inter is not installed here -> recorded per family + style with the number of text objects
+        self.assertIn("Inter", report.missing_font_families())
+        bold = next(e for e in report.missing_fonts if e["family"] == "Inter" and e["style"] == "Bold")
+        self.assertEqual((bold["count"], bold["postscript"]), (2, "Inter-Bold"))  # Title + New label
+        self.assertIn("Inter Bold (2 text objects)", report.missing_font_labels())
+        self.assertIn("fonts not found: Inter Bold (2 text objects)", report.summary())
         self.assertEqual(title["figma_font"], "Inter")
         body = self._by_name(report, "Body")
         self.assertEqual(body.data.align_x, "CENTER")
@@ -853,6 +857,55 @@ class BuilderTests(unittest.TestCase):
         removed = bpy.data.collections["Page 1 (removed)"]
         self.assertIn(by_id2["I3:10;3:3"], list(removed.objects))
         self.assertEqual(report3.sync["moved"], 6)
+
+    # -- fonts: user folder, missing list -------------------------------------------
+
+    def test_user_fonts_folder_and_missing_list(self):
+        from figma_to_blender import fonts
+
+        real = next((e.path for e in fonts.system_font_index() if e.path.endswith((".ttf", ".otf"))), None)
+        if real is None:
+            self.skipTest("no system font file to stand in for a user font")
+        fonts_dir = os.path.join(self.tmp, "myfonts", "nested")
+        os.makedirs(fonts_dir)
+        # a real font file named like Figma's PostScript name: matched by file name, loadable by Blender
+        shutil.copy(real, os.path.join(fonts_dir, "Inter-SemiBold.ttf"))
+        with open(os.path.join(fonts_dir, "Roboto-Medium.woff2"), "wb") as fh:  # skipped, cannot be loaded
+            fh.write(b"wOF2")
+        try:
+            scene, report, _ = self._build("SVG", fonts_dir=os.path.join(self.tmp, "myfonts"))
+            label = self._by_name(report, "Label")  # Inter-SemiBold
+            self.assertIsNotNone(label.data.font)
+            self.assertTrue(label.data.font.filepath.endswith("Inter-SemiBold.ttf"))
+            self.assertEqual(label["figma_font_file"], label.data.font.filepath)
+            # the three button labels (component + 2 instances) share the same font through the shared / matched data
+            for eid in ("3:3", "I3:10;3:3", "I3:20;3:3"):
+                ob = next(o for o in report.objects if o.get("figma_elem_id") == eid)
+                self.assertTrue(ob.data.font.filepath.endswith("Inter-SemiBold.ttf"), eid)
+            # the missing list: family + style + how many text objects, Semi Bold no longer in it
+            missing = {(e["family"], e["style"]): e["count"] for e in report.missing_fonts}
+            self.assertNotIn(("Inter", "Semi Bold"), missing)
+            self.assertEqual(missing[("Inter", "Bold")], 2)  # Title, New label
+            self.assertEqual(missing[("Roboto", "Medium")], 1)  # Standalone label (woff2 is skipped)
+            self.assertEqual(report.missing_font_labels(), ["Inter Bold (2 text objects)", "Inter Regular (1 text object)", "Roboto Medium (1 text object)"])
+            # the add-on stores the list on the scene for the panel
+            import figma_to_blender
+
+            figma_to_blender.register()
+            try:
+                s = bpy.context.scene.figma_to_blender
+                s.bundle_dir = self.tmp
+                s.fonts_dir = os.path.join(self.tmp, "myfonts")
+                s.center = False
+                self.assertEqual(bpy.ops.figma.import_bundle(), {"FINISHED"})
+                self.assertEqual(s.missing_fonts.split("\n"), ["Inter Bold (2 text objects)", "Inter Regular (1 text object)", "Roboto Medium (1 text object)"])
+                self.assertEqual(figma_to_blender.build_options(s, bpy.context).fonts_dir, os.path.join(self.tmp, "myfonts"))
+                s.fonts_dir = ""
+                self.assertIsNone(figma_to_blender.build_options(s, bpy.context).fonts_dir)  # no preference set either
+            finally:
+                figma_to_blender.unregister()
+        finally:
+            fonts._USER_INDEX.clear()
 
     # -- 3D presets and curved screen ---------------------------------------------
 
